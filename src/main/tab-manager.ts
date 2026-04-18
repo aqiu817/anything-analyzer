@@ -1,7 +1,7 @@
 import { EventEmitter } from "events";
 import { v4 as uuidv4 } from "uuid";
 import { BrowserWindow, WebContentsView } from "electron";
-import type { WebContents } from "electron";
+import type { WebContents, Session as ElectronSession } from "electron";
 
 interface TabInfo {
   id: string;
@@ -10,12 +10,24 @@ interface TabInfo {
   title: string;
 }
 
+/** Snapshot of a session's tab group state (kept alive while hidden). */
+interface SessionTabGroup {
+  tabs: Map<string, TabInfo>;
+  activeTabId: string | null;
+  electronSession: ElectronSession;
+}
+
 /**
  * TabManager — Manages multiple browser tabs as WebContentsView instances.
  * Each tab gets its own WebContentsView, only the active tab is displayed.
  * Popup windows (window.open) are intercepted and opened as new tabs.
+ *
+ * Supports per-session tab groups: each app session owns an isolated set of
+ * tabs. Switching sessions hides the old group and restores (or creates) the
+ * new group — WebContentsView instances stay alive so page state is preserved.
  */
 export class TabManager extends EventEmitter {
+  /** Tabs for the currently visible session group. */
   private tabs = new Map<string, TabInfo>();
   private activeTabId: string | null = null;
   private mainWindow: BrowserWindow | null = null;
@@ -25,6 +37,14 @@ export class TabManager extends EventEmitter {
   private destroyedTabs = new Set<string>();
   /** True when app is quitting: no tab recreation/new tabs allowed */
   private isShuttingDown = false;
+  /** Electron session for the active app session (partition isolation) */
+  private activeElectronSession: ElectronSession | null = null;
+
+  // ---- Per-session tab groups ----
+  /** Stored tab groups for sessions that are not currently visible. */
+  private sessionGroups = new Map<string, SessionTabGroup>();
+  /** The session group ID currently driving `this.tabs`. */
+  private currentGroupId: string | null = null;
 
   /**
    * Initialize with the main window and a bounds calculator callback.
@@ -40,6 +60,107 @@ export class TabManager extends EventEmitter {
   }
 
   /**
+   * Switch the visible tab group to a different session.
+   * - Hides (but keeps alive) the current session's tabs.
+   * - Restores a previously stored group, or creates a blank tab if first visit.
+   * - Emits tab events so the renderer UI stays in sync.
+   *
+   * Returns true if a new blank tab was created (caller may want to navigate).
+   */
+  switchSessionGroup(groupId: string, elSession: ElectronSession): boolean {
+    if (this.currentGroupId === groupId) return false;
+
+    // 1. Stash current group ---------------------------------------------------
+    if (this.currentGroupId !== null) {
+      // Remove active tab view from the window
+      this.hideActiveView();
+
+      this.sessionGroups.set(this.currentGroupId, {
+        tabs: this.tabs,
+        activeTabId: this.activeTabId,
+        electronSession: this.activeElectronSession!,
+      });
+
+      // Tell renderer to clear its tab list (emit close for every visible tab)
+      for (const [, tab] of this.tabs) {
+        this.emit("tab-closed", { tabId: tab.id });
+      }
+    } else if (this.tabs.size > 0) {
+      // First-ever switch: there may be initial default-session tabs.
+      // Stash them under a special key so they don't leak.
+      this.hideActiveView();
+      for (const [, tab] of this.tabs) {
+        this.emit("tab-closed", { tabId: tab.id });
+      }
+      // Destroy default-session tabs — they can't be reused in a partition
+      for (const [tabId, tab] of this.tabs) {
+        try { tab.view.webContents.close(); } catch { /* ignore */ }
+        this.destroyedTabs.add(tabId);
+      }
+    }
+
+    // Reset working state
+    this.tabs = new Map();
+    this.activeTabId = null;
+    this.activeElectronSession = elSession;
+    this.currentGroupId = groupId;
+
+    // 2. Restore or create group -----------------------------------------------
+    const existing = this.sessionGroups.get(groupId);
+    let createdNew = false;
+
+    if (existing && existing.tabs.size > 0) {
+      // Restore previously stashed tabs
+      this.tabs = existing.tabs;
+      this.activeElectronSession = existing.electronSession;
+      this.sessionGroups.delete(groupId);
+
+      // Notify renderer about restored tabs
+      for (const [, tab] of this.tabs) {
+        this.emit("tab-created", { id: tab.id, url: tab.url, title: tab.title });
+      }
+
+      // Activate the tab that was active before
+      const restoreId =
+        existing.activeTabId && this.tabs.has(existing.activeTabId)
+          ? existing.activeTabId
+          : this.tabs.keys().next().value;
+      if (restoreId) {
+        this.activateTab(restoreId);
+      }
+    } else {
+      // First visit to this session — create a blank tab
+      this.sessionGroups.delete(groupId); // remove stale empty entry if any
+      this.createTab();
+      createdNew = true;
+    }
+
+    return createdNew;
+  }
+
+  /**
+   * Destroy all tabs belonging to a specific session group.
+   * Used when deleting a session.
+   */
+  destroySessionGroup(groupId: string): void {
+    // If it's the current group, clear visible tabs
+    if (this.currentGroupId === groupId) {
+      this.destroyAllTabs();
+      this.currentGroupId = null;
+      return;
+    }
+    // Otherwise destroy the stashed group
+    const group = this.sessionGroups.get(groupId);
+    if (group) {
+      for (const [tabId, tab] of group.tabs) {
+        try { tab.view.webContents.close(); } catch { /* ignore */ }
+        this.destroyedTabs.add(tabId);
+      }
+      this.sessionGroups.delete(groupId);
+    }
+  }
+
+  /**
    * Create a new tab. Optionally navigate to a URL.
    * The new tab becomes the active tab.
    */
@@ -52,6 +173,9 @@ export class TabManager extends EventEmitter {
         sandbox: false,
         contextIsolation: true,
         nodeIntegration: false,
+        ...(this.activeElectronSession
+          ? { session: this.activeElectronSession }
+          : {}),
       },
     });
 
@@ -180,8 +304,18 @@ export class TabManager extends EventEmitter {
     this.isShuttingDown = shuttingDown;
   }
 
+  /** Set the Electron session used for new tabs (partition isolation). */
+  setActiveElectronSession(s: ElectronSession | null): void {
+    this.activeElectronSession = s;
+  }
+
+  /** Get the current session group ID. */
+  getCurrentGroupId(): string | null {
+    return this.currentGroupId;
+  }
+
   /**
-   * Destroy all tabs and clean up.
+   * Destroy all tabs and clean up (current visible group only).
    */
   destroyAllTabs(): void {
     for (const [tabId, tab] of this.tabs) {
@@ -201,6 +335,33 @@ export class TabManager extends EventEmitter {
     }
     this.tabs.clear();
     this.activeTabId = null;
+  }
+
+  /**
+   * Destroy ALL tabs across ALL session groups (used on app quit).
+   */
+  destroyEverything(): void {
+    this.destroyAllTabs();
+    for (const [, group] of this.sessionGroups) {
+      for (const [tabId, tab] of group.tabs) {
+        try { tab.view.webContents.close(); } catch { /* ignore */ }
+        this.destroyedTabs.add(tabId);
+      }
+    }
+    this.sessionGroups.clear();
+  }
+
+  // ---- Internal helpers ----
+
+  /** Remove the active tab's view from the window (without destroying it). */
+  private hideActiveView(): void {
+    if (!this.mainWindow || !this.activeTabId) return;
+    const tab = this.tabs.get(this.activeTabId);
+    if (tab) {
+      try {
+        this.mainWindow.contentView.removeChildView(tab.view);
+      } catch { /* not in view */ }
+    }
   }
 
   /**

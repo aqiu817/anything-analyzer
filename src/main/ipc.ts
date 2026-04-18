@@ -92,10 +92,12 @@ export function registerIpcHandlers(deps: {
     const tabManager = windowManager.getTabManager();
     const mainWin = windowManager.getMainWindow();
     if (!tabManager || !mainWin) throw new Error("Browser not ready");
+    const proxyConfig = loadProxyConfig();
     await sessionManager.startCapture(
       sessionId,
       tabManager,
       mainWin.webContents,
+      proxyConfig,
     );
   });
 
@@ -112,7 +114,8 @@ export function registerIpcHandlers(deps: {
   });
 
   ipcMain.handle("session:delete", async (_event, sessionId: string) => {
-    await sessionManager.deleteSession(sessionId);
+    const tabManager = windowManager.getTabManager();
+    await sessionManager.deleteSession(sessionId, tabManager ?? undefined);
   });
 
   // ---- Window Control (frameless window) ----
@@ -157,8 +160,9 @@ export function registerIpcHandlers(deps: {
   });
 
   ipcMain.handle("browser:clearEnv", async () => {
-    await session.defaultSession.clearStorageData();
-    await session.defaultSession.clearCache();
+    const elSession = sessionManager.getActiveElectronSession() ?? session.defaultSession;
+    await elSession.clearStorageData();
+    await elSession.clearCache();
     windowManager.getTabManager()?.getActiveWebContents()?.reload();
   });
 
@@ -456,6 +460,11 @@ export function registerIpcHandlers(deps: {
   ipcMain.handle("proxy:save", async (_event, config: ProxyConfig) => {
     saveProxyConfigFile(config);
     await applyProxy(config);
+    // Also apply to the active session's partition if one exists
+    const activeElSession = sessionManager.getActiveElectronSession();
+    if (activeElSession) {
+      await applyProxy(config, activeElSession);
+    }
   });
 
   // ---- MCP Server Config ----
@@ -602,7 +611,8 @@ export function registerIpcHandlers(deps: {
   ipcMain.handle("fingerprint:enable", async (_event, sessionId: string) => {
     const tabManager = windowManager.getTabManager();
     if (!tabManager) throw new Error("Browser not ready");
-    await sessionManager.enableStealth(sessionId, tabManager);
+    const proxyConfig = loadProxyConfig();
+    await sessionManager.enableStealth(sessionId, tabManager, proxyConfig);
   });
 
   ipcMain.handle("fingerprint:disable", async () => {
@@ -650,16 +660,19 @@ function saveProxyConfigFile(config: ProxyConfig): void {
   writeFileSync(getProxyConfigPath(), JSON.stringify(config, null, 2), "utf-8");
 }
 
-export async function applyProxy(config: ProxyConfig | null): Promise<void> {
+export async function applyProxy(
+  config: ProxyConfig | null,
+  elSession: Electron.Session = session.defaultSession,
+): Promise<void> {
   if (!config || config.type === "none") {
-    await session.defaultSession.setProxy({ mode: "direct" });
+    await elSession.setProxy({ mode: "direct" });
     return;
   }
   const auth = config.username && config.password
     ? `${config.username}:${config.password}@`
     : "";
   const proxyRules = `${config.type}://${auth}${config.host}:${config.port}`;
-  await session.defaultSession.setProxy({ proxyRules });
+  await elSession.setProxy({ proxyRules });
 }
 
 // ---- MCP Server config persistence ----

@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { ipcMain, session as electronSession } from "electron";
-import type { WebContents } from "electron";
-import type { Session } from "@shared/types";
+import type { WebContents, Session as ElectronSession } from "electron";
+import type { Session, ProxyConfig } from "@shared/types";
 import type { SessionsRepo } from "../db/repositories";
 import type { TabManager } from "../tab-manager";
 import { CdpManager } from "../cdp/cdp-manager";
@@ -30,6 +30,11 @@ export class SessionManager {
   private tabManager: TabManager | null = null;
   private tabCaptures = new Map<string, TabCaptureBundle>();
 
+  /** Cached Electron partition sessions keyed by app session ID */
+  private electronSessions = new Map<string, ElectronSession>();
+  /** The app session ID currently driving the browser partition */
+  private activePartitionSessionId: string | null = null;
+
   /** Global hook IPC handler (registered once per session) */
   private hookIpcHandler:
     | ((event: Electron.IpcMainEvent, data: unknown) => void)
@@ -54,6 +59,69 @@ export class SessionManager {
     private captureEngine: CaptureEngine,
     private profileStore?: ProfileStore,
   ) {}
+
+  // =============================================
+  // Partition Session Management
+  // =============================================
+
+  /** Get or create an isolated Electron session for the given app session. */
+  private getElectronSession(sessionId: string): ElectronSession {
+    if (!this.electronSessions.has(sessionId)) {
+      this.electronSessions.set(
+        sessionId,
+        electronSession.fromPartition(`persist:session-${sessionId}`),
+      );
+    }
+    return this.electronSessions.get(sessionId)!;
+  }
+
+  /** Return the Electron session for the currently active app session (capture or stealth). */
+  getActiveElectronSession(): ElectronSession | null {
+    const activeId = this.currentSessionId ?? this.stealthSessionId;
+    if (!activeId) return null;
+    return this.getElectronSession(activeId);
+  }
+
+  /** Apply proxy config to an Electron session. */
+  private async applyProxyToSession(
+    elSession: ElectronSession,
+    config: ProxyConfig | null,
+  ): Promise<void> {
+    if (!config || config.type === "none") {
+      await elSession.setProxy({ mode: "direct" });
+      return;
+    }
+    const auth =
+      config.username && config.password
+        ? `${config.username}:${config.password}@`
+        : "";
+    await elSession.setProxy({
+      proxyRules: `${config.type}://${auth}${config.host}:${config.port}`,
+    });
+  }
+
+  /**
+   * Switch the browser environment to a specific session's partition.
+   * Uses TabManager's session group to hide/restore tabs instead of destroying them.
+   */
+  private async switchBrowserToSession(
+    sessionId: string,
+    tabManager: TabManager,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<boolean> {
+    if (this.activePartitionSessionId === sessionId) return false;
+
+    const elSession = this.getElectronSession(sessionId);
+
+    // Apply upstream proxy to the new partition (before tabs open)
+    if (proxyConfig !== undefined) {
+      await this.applyProxyToSession(elSession, proxyConfig ?? null);
+    }
+
+    const createdNew = tabManager.switchSessionGroup(sessionId, elSession);
+    this.activePartitionSessionId = sessionId;
+    return createdNew;
+  }
 
   /**
    * Create a new session record.
@@ -83,6 +151,7 @@ export class SessionManager {
     sessionId: string,
     tabManager: TabManager,
     rendererWebContents: WebContents,
+    proxyConfig?: ProxyConfig | null,
   ): Promise<void> {
     const session = this.sessionsRepo.findById(sessionId);
     if (!session) throw new Error(`Session ${sessionId} not found`);
@@ -97,16 +166,19 @@ export class SessionManager {
       this.suspendStealthListeners();
     }
 
+    // Switch browser to this session's isolated partition
+    await this.switchBrowserToSession(sessionId, tabManager, proxyConfig);
+
     this.currentSessionId = sessionId;
     this.tabManager = tabManager;
 
     // Start capture engine
     this.captureEngine.start(sessionId, rendererWebContents);
 
-    // Apply fingerprint HTTP spoofing
+    // Apply fingerprint HTTP spoofing to the session's partition
     if (this.profileStore) {
       const profile = this.profileStore.getOrCreate(sessionId);
-      applyHttpSpoofing(electronSession.defaultSession, profile);
+      applyHttpSpoofing(this.getElectronSession(sessionId), profile);
     }
 
     // Register global hook IPC listener (once for all tabs)
@@ -304,8 +376,8 @@ export class SessionManager {
     }
 
     this.captureEngine.stop();
-    // Remove HTTP spoofing (capture's own spoofing)
-    removeHttpSpoofing(electronSession.defaultSession);
+    // Remove HTTP spoofing from the session's partition
+    removeHttpSpoofing(this.getElectronSession(sessionId));
     this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
     this.currentSessionId = null;
 
@@ -313,7 +385,7 @@ export class SessionManager {
     if (this.stealthSessionId && this.stealthTabManager) {
       const profile = this.profileStore?.getOrCreate(this.stealthSessionId);
       if (profile) {
-        applyHttpSpoofing(electronSession.defaultSession, profile);
+        applyHttpSpoofing(this.getElectronSession(this.stealthSessionId), profile);
       }
       this.restoreStealthListeners();
     }
@@ -332,6 +404,7 @@ export class SessionManager {
   async enableStealth(
     sessionId: string,
     tabManager: TabManager,
+    proxyConfig?: ProxyConfig | null,
   ): Promise<void> {
     if (!this.profileStore) return;
 
@@ -349,9 +422,21 @@ export class SessionManager {
     this.stealthSessionId = sessionId;
     this.stealthTabManager = tabManager;
 
-    // Apply HTTP-level spoofing (User-Agent, Client Hints, Accept-Language)
+    // Switch browser to this session's isolated partition (hides old tabs, restores/creates new)
+    const createdNew = await this.switchBrowserToSession(sessionId, tabManager, proxyConfig);
+
+    // If this is the session's first visit (blank tab created), navigate to target URL
+    if (createdNew) {
+      const session = this.sessionsRepo.findById(sessionId);
+      if (session?.target_url) {
+        tabManager.getActiveWebContents()?.loadURL(session.target_url).catch(() => {});
+      }
+    }
+
+    // Apply HTTP-level spoofing to the session's partition
+    const elSession = this.getElectronSession(sessionId);
     const profile = this.profileStore.getOrCreate(sessionId);
-    applyHttpSpoofing(electronSession.defaultSession, profile);
+    applyHttpSpoofing(elSession, profile);
 
     // Attach stealth to all existing tabs
     for (const tab of tabManager.getAllTabs()) {
@@ -392,8 +477,10 @@ export class SessionManager {
     this.stealthTabClosedHandler = null;
     this.stealthTabManager = null;
 
-    // Remove HTTP spoofing
-    removeHttpSpoofing(electronSession.defaultSession);
+    // Remove HTTP spoofing from the session's partition
+    if (this.stealthSessionId) {
+      removeHttpSpoofing(this.getElectronSession(this.stealthSessionId));
+    }
 
     this.stealthSessionId = null;
   }
@@ -502,9 +589,26 @@ export class SessionManager {
   /**
    * Delete a session.
    */
-  async deleteSession(sessionId: string): Promise<void> {
+  async deleteSession(sessionId: string, tabManager?: TabManager): Promise<void> {
     if (this.currentSessionId === sessionId) {
       await this.stopCapture(sessionId);
+    }
+    if (this.stealthSessionId === sessionId) {
+      await this.disableStealth();
+    }
+    // Destroy tabs belonging to this session
+    if (tabManager) {
+      tabManager.destroySessionGroup(sessionId);
+    }
+    // Clean up isolated browser data for this session's partition
+    const elSession = this.electronSessions.get(sessionId);
+    if (elSession) {
+      await elSession.clearStorageData().catch(() => {});
+      await elSession.clearCache().catch(() => {});
+      this.electronSessions.delete(sessionId);
+    }
+    if (this.activePartitionSessionId === sessionId) {
+      this.activePartitionSessionId = null;
     }
     this.sessionsRepo.delete(sessionId);
   }

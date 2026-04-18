@@ -125,21 +125,18 @@ function App(): React.ReactElement {
   useEffect(() => {
     setSelectedSeqs([])
     setSelectedRequestId(null)
-    if (currentSession?.target_url) {
-      window.electronAPI.navigate(currentSession.target_url).catch((err) => {
-        console.error('Session navigation failed:', err)
-      })
+    const setup = async (): Promise<void> => {
+      if (currentSessionId) {
+        // Switch to session's isolated partition (hides old tabs, restores/creates new)
+        // Navigation to target_url is handled in main process when a blank tab is created
+        await window.electronAPI.enableFingerprint(currentSessionId)
+      } else {
+        await window.electronAPI.disableFingerprint()
+      }
     }
-    // Enable/disable standalone fingerprint based on session selection
-    if (currentSessionId) {
-      window.electronAPI.enableFingerprint(currentSessionId).catch((err) => {
-        console.error('Enable fingerprint failed:', err)
-      })
-    } else {
-      window.electronAPI.disableFingerprint().catch((err) => {
-        console.error('Disable fingerprint failed:', err)
-      })
-    }
+    setup().catch((err) => {
+      console.error('Session setup failed:', err)
+    })
   }, [currentSessionId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Report exact browser placeholder bounds to main process via ResizeObserver

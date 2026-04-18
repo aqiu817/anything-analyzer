@@ -216,7 +216,7 @@ export class WindowManager {
    * Destroy all tabs and clean up.
    */
   destroyTargetView(): void {
-    this.tabManager?.destroyAllTabs();
+    this.tabManager?.destroyEverything();
     this.tabManager = null;
   }
 }
