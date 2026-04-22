@@ -15,11 +15,7 @@ jobs:
           - os: windows-latest
             platform: win
           - os: macos-latest
-            platform: mac-arm64
-            arch: arm64
-          - os: macos-latest
-            platform: mac-x64
-            arch: x64
+            platform: mac
           - os: ubuntu-latest
             platform: linux
 
@@ -52,8 +48,19 @@ jobs:
         run: npx electron-builder --win --publish never
 
       - name: Package for macOS
-        if: startsWith(matrix.platform, 'mac')
-        run: npx electron-builder --mac --${{ matrix.arch }} --publish never
+        if: matrix.platform == 'mac'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --x64 --arm64 --publish never
+
+      - name: Verify macOS updater metadata
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          test -f dist/latest-mac.yml
+          cat dist/latest-mac.yml
+          grep -q 'arm64\.zip' dist/latest-mac.yml
+          grep -q 'x64\.zip' dist/latest-mac.yml
 
       - name: Package for Linux
         if: matrix.platform == 'linux'
