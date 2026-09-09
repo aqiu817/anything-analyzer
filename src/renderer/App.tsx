@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react'
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 
 import Titlebar from './components/Titlebar'
 import type { AppView } from './components/Titlebar'
@@ -14,6 +14,12 @@ import RequestDetail from './components/RequestDetail'
 import HookLog from './components/HookLog'
 import StorageView from './components/StorageView'
 import ReportView from './components/ReportView'
+import {
+  buildContextUsageSnapshot,
+  resolveContextUsedTokens,
+} from '@shared/token-estimate'
+import { stripToolContext } from '@shared/types'
+import InteractionLog from './components/InteractionLog'
 import { useSession } from './hooks/useSession'
 import { useCapture } from './hooks/useCapture'
 import { useTabs } from './hooks/useTabs'
@@ -43,7 +49,7 @@ function App(): React.ReactElement {
     stopCapture
   } = useSession()
 
-  const { tabs, activeTabId, activeTabUrl, activateTab, closeTab, createTab } = useTabs()
+  const { tabs, activeTabId, activeTabUrl, isActiveTabLoading, activateTab, closeTab, createTab } = useTabs()
 
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [activeView, setActiveView] = useState<AppView>('browser')
@@ -116,7 +122,82 @@ function App(): React.ReactElement {
   /** Ref to browser placeholder for reporting exact bounds to main process */
   const placeholderRef = useRef<HTMLDivElement>(null)
 
-  const { requests, hooks, snapshots, reports, isAnalyzing, analysisError, streamingContent, startAnalysis, cancelAnalysis, chatHistory, isChatting, chatError, sendFollowUp, clearCaptureData } = useCapture(currentSessionId)
+  const { requests, hooks, snapshots, reports, interactions, isAnalyzing, analysisError, streamingContent, startAnalysis, cancelAnalysis, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData } = useCapture(currentSessionId)
+
+  const [budgetCfg, setBudgetCfg] = useState({
+    maxContextTokens: 200_000,
+    reserveCompletionTokens: 8_192,
+    compressionPeak: 0.85,
+  })
+  const [defaultModel, setDefaultModel] = useState('')
+  const [selectedAnalysisModel, setSelectedAnalysisModel] = useState('')
+  const [reportModelOptions, setReportModelOptions] = useState<string[]>([])
+  const [isLoadingReportModels, setIsLoadingReportModels] = useState(false)
+  const reportModelsLoadedRef = useRef(false)
+
+  useEffect(() => {
+    let alive = true
+    window.electronAPI.getLLMConfig().then((config) => {
+      if (!alive || !config) return
+      setDefaultModel(config.model)
+      setSelectedAnalysisModel(prev => prev || config.model)
+      setReportModelOptions(prev => [...new Set([...prev, config.model].filter(Boolean))])
+      if (config.contextBudget) {
+        const b = config.contextBudget
+        setBudgetCfg({
+          maxContextTokens: b.maxContextTokens ?? 200_000,
+          reserveCompletionTokens: b.reserveCompletionTokens ?? 8_192,
+          compressionPeak: b.compressionPeak ?? 0.85,
+        })
+      }
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  const loadReportModels = useCallback(async () => {
+    setIsLoadingReportModels(true)
+    try {
+      const models = await window.electronAPI.listLLMModels()
+      const currentReportModel = reports[0]?.llm_model
+      setReportModelOptions([
+        ...new Set([...models, defaultModel, currentReportModel].filter((item): item is string => Boolean(item))),
+      ])
+      reportModelsLoadedRef.current = true
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsLoadingReportModels(false)
+    }
+  }, [defaultModel, reports, toast])
+
+  useEffect(() => {
+    if (activeView === 'report' && !reportModelsLoadedRef.current) {
+      loadReportModels().catch(() => {})
+    }
+  }, [activeView, loadReportModels])
+
+  useEffect(() => {
+    const reportModel = reports[0]?.llm_model
+    if (reportModel) {
+      setSelectedAnalysisModel(reportModel)
+      setReportModelOptions(prev => [...new Set([...prev, reportModel])])
+    } else if (defaultModel) {
+      setSelectedAnalysisModel(prev => prev || defaultModel)
+    }
+  }, [reports, defaultModel])
+
+  const contextUsage = useMemo(() => {
+    const messages = chatHistory.map((m) => ({ content: stripToolContext(m.content) }))
+    if (messages.length === 0 && reports[0]?.report_content) {
+      messages.push({ content: reports[0].report_content })
+    }
+    const used = resolveContextUsedTokens({
+      latestUsage: latestContextUsage,
+      fallbackMessages: messages,
+    })
+    return buildContextUsageSnapshot(used, budgetCfg)
+  }, [chatHistory, latestContextUsage, reports, budgetCfg])
+
 
   const selectedRequest = requests.find(r => r.id === selectedRequestId) || null
 
@@ -139,10 +220,14 @@ function App(): React.ReactElement {
     })
   }, [currentSessionId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Report exact browser placeholder bounds to main process via ResizeObserver
+  // Report the real browser placeholder bounds to the native WebContentsView.
+  // The placeholder is conditional (it does not exist before a session is selected),
+  // so this effect MUST re-run when its visibility changes. Previously it only ran
+  // on App mount; on Windows the native view retained the fixed fallback bounds and
+  // could overlap the capture controls, swallowing Start/Pause/Stop clicks.
   useEffect(() => {
     const el = placeholderRef.current
-    if (!el) return
+    if (!el || activeView !== 'browser' || !currentSession) return
 
     const reportBounds = () => {
       const rect = el.getBoundingClientRect()
@@ -159,7 +244,7 @@ function App(): React.ReactElement {
     reportBounds()
 
     return () => observer.disconnect()
-  }, [])
+  }, [activeView, currentSession])
 
   // Hide/show browser view based on active view and session
   useEffect(() => {
@@ -188,11 +273,15 @@ function App(): React.ReactElement {
   }, [])
 
   // Analyze handler
-  const handleAnalyze = useCallback(async (purpose?: string) => {
+  const handleAnalyze = useCallback(async (purpose?: string, model?: string) => {
     if (!currentSessionId) return
     setActiveView('report')
-    await startAnalysis(currentSessionId, purpose, selectedSeqs.length > 0 ? selectedSeqs : undefined)
+    await startAnalysis(currentSessionId, purpose, selectedSeqs.length > 0 ? selectedSeqs : undefined, model)
   }, [currentSessionId, startAnalysis, selectedSeqs])
+
+  const handleReportAnalyze = useCallback(async (model?: string) => {
+    await handleAnalyze(undefined, model)
+  }, [handleAnalyze])
 
   // Cancel analysis handler
   const handleCancelAnalysis = useCallback(async () => {
@@ -252,6 +341,38 @@ function App(): React.ReactElement {
     await sendFollowUp(currentSessionId, msg)
   }, [currentSessionId, sendFollowUp])
 
+  const handleStartCapture = useCallback(() => {
+    void startCapture().catch((err) => {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error('Start capture failed:', err)
+      toast.error(`${t('capture.start')}失败：${message}`)
+    })
+  }, [startCapture, toast, t])
+
+  const handlePauseCapture = useCallback(() => {
+    void pauseCapture().catch((err) => {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error('Pause capture failed:', err)
+      toast.error(`${t('capture.pause')}失败：${message}`)
+    })
+  }, [pauseCapture, toast, t])
+
+  const handleResumeCapture = useCallback(() => {
+    void resumeCapture().catch((err) => {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error('Resume capture failed:', err)
+      toast.error(`${t('capture.resume')}失败：${message}`)
+    })
+  }, [resumeCapture, toast, t])
+
+  const handleStopCapture = useCallback(() => {
+    void stopCapture().catch((err) => {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error('Stop capture failed:', err)
+      toast.error(`${t('capture.stop')}失败：${message}`)
+    })
+  }, [stopCapture, toast, t])
+
   // Pill button style for capture controls in browser address bar
   const pillStyle: React.CSSProperties = {
     padding: '5px 14px',
@@ -277,7 +398,7 @@ function App(): React.ReactElement {
     if (!currentSession?.status || currentSession.status === 'stopped') {
       return (
         <>
-          <button style={pillStart} onClick={startCapture}>● {t('browser.start')}</button>
+          <button style={pillStart} onClick={handleStartCapture}>● {t('browser.start')}</button>
           <button style={pillDisabled}>⏸ {t('browser.pause')}</button>
           <button style={pillDisabled}>■ {t('browser.stop')}</button>
         </>
@@ -287,8 +408,8 @@ function App(): React.ReactElement {
       return (
         <>
           <button style={pillActive}>● {t('browser.start')}</button>
-          <button style={pillPause} onClick={pauseCapture}>⏸ {t('browser.pause')}</button>
-          <button style={pillStop} onClick={stopCapture}>■ {t('browser.stop')}</button>
+          <button style={pillPause} onClick={handlePauseCapture}>⏸ {t('browser.pause')}</button>
+          <button style={pillStop} onClick={handleStopCapture}>■ {t('browser.stop')}</button>
         </>
       )
     }
@@ -296,8 +417,8 @@ function App(): React.ReactElement {
       return (
         <>
           <button style={pillPauseActive}>⏸ {t('browser.pause')}</button>
-          <button style={pillStart} onClick={resumeCapture}>▶ {t('browser.resume')}</button>
-          <button style={pillStop} onClick={stopCapture}>■ {t('browser.stop')}</button>
+          <button style={pillStart} onClick={handleResumeCapture}>▶ {t('browser.resume')}</button>
+          <button style={pillStop} onClick={handleStopCapture}>■ {t('browser.stop')}</button>
         </>
       )
     }
@@ -389,12 +510,14 @@ function App(): React.ReactElement {
           {/* Browser panel - address bar + nav buttons + capture pills */}
           <BrowserPanel
             currentUrl={activeTabUrl}
+            isLoading={isActiveTabLoading}
             onNavigate={handleNavigate}
             onBack={handleBack}
             onForward={handleForward}
             onReload={handleReload}
             captureSlot={buildCaptureSlot()}
             onClearEnv={handleClearEnv}
+            onToggleDevTools={() => window.electronAPI.toggleDevTools()}
           />
 
           {/* Browser view placeholder — native WebContentsView overlays this area */}
@@ -474,6 +597,12 @@ function App(): React.ReactElement {
             >
               {t('data.storage')} <span style={inspectorTabCountStyle}>{snapshots.length}</span>
             </button>
+            <button
+              style={activeTab === 'interactions' ? inspectorTabActiveStyle : inspectorTabStyle}
+              onClick={() => setActiveTab('interactions')}
+            >
+              {t('data.interactions')} <span style={inspectorTabCountStyle}>{interactions.length}</span>
+            </button>
 
             {/* Spacer */}
             <div style={{ flex: 1 }} />
@@ -524,11 +653,15 @@ function App(): React.ReactElement {
             <div style={{ flex: 1, overflow: 'auto', padding: '0 12px' }}>
               <HookLog hooks={hooks} />
             </div>
-          ) : (
+          ) : activeTab === 'storage' ? (
             <div style={{ flex: 1, overflow: 'auto', padding: '0 12px' }}>
               <StorageView snapshots={snapshots} />
             </div>
-          )}
+          ) : activeTab === 'interactions' ? (
+            <div style={{ flex: 1, overflow: 'hidden', padding: '0 12px' }}>
+              <InteractionLog interactions={interactions} />
+            </div>
+          ) : null}
 
           {/* Bottom AnalyzeBar */}
           <AnalyzeBar
@@ -556,7 +689,7 @@ function App(): React.ReactElement {
           isAnalyzing={isAnalyzing}
           analysisError={analysisError}
           streamingContent={streamingContent}
-          onReAnalyze={handleAnalyze}
+          onReAnalyze={handleReportAnalyze}
           onCancelAnalysis={handleCancelAnalysis}
           chatHistory={chatHistory}
           isChatting={isChatting}
@@ -565,6 +698,13 @@ function App(): React.ReactElement {
           sessionName={currentSession?.name}
           requests={requests}
           hooks={hooks}
+          contextUsage={contextUsage}
+          contextSource={latestContextUsage}
+          availableModels={reportModelOptions}
+          selectedModel={selectedAnalysisModel}
+          isLoadingModels={isLoadingReportModels}
+          onModelChange={setSelectedAnalysisModel}
+          onRefreshModels={loadReportModels}
         />
       ) : (
         renderEmptyGuide()
@@ -624,10 +764,13 @@ function App(): React.ReactElement {
         status={currentSession?.status ?? null}
         requestCount={requests.length}
         hookCount={hooks.length}
+        interactionCount={interactions.length}
         sessionName={currentSession?.name}
         activeView={activeView}
         llmModel={reports[0]?.llm_model}
         tokenCount={reports[0] ? (reports[0].prompt_tokens ?? 0) + (reports[0].completion_tokens ?? 0) : undefined}
+        contextUsageRatio={activeView === 'report' ? contextUsage.usageRatio : undefined}
+        contextNearPeak={activeView === 'report' ? contextUsage.nearPeak || contextUsage.overPeak : undefined}
       />
 
       {/* Settings modal */}

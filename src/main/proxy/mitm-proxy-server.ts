@@ -2,12 +2,19 @@ import { EventEmitter } from "events";
 import * as http from "http";
 import * as https from "https";
 import * as net from "net";
+import { networkInterfaces } from "os";
 import * as tls from "tls";
 import * as url from "url";
+import {
+  brotliDecompressSync,
+  gunzipSync,
+  inflateSync,
+} from "zlib";
 import { v4 as uuidv4 } from "uuid";
 import { SocksClient } from "socks";
 import type { CaManager } from "./ca-manager";
 import type { ProxyConfig } from "../../shared/types";
+import { generateCertPage, getCertFileContent, getCertDerContent, isCertDownloadHost } from "./cert-download-page";
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1MB — same limit as CdpManager
 const BINARY_CONTENT_TYPES = [
@@ -20,6 +27,43 @@ const BINARY_CONTENT_TYPES = [
   "application/zip",
 ];
 const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot|map)$/i;
+
+function headerToString(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value.join(",") : value || "";
+}
+
+function decodeCapturedBody(
+  body: Buffer,
+  contentEncoding: string | string[] | undefined,
+): Buffer {
+  const encodings = headerToString(contentEncoding)
+    .toLowerCase()
+    .split(",")
+    .map((encoding) => encoding.trim())
+    .filter(Boolean);
+
+  return encodings.reduceRight((decoded, encoding) => {
+    if (encoding === "br") return brotliDecompressSync(decoded);
+    if (encoding === "gzip" || encoding === "x-gzip") {
+      return gunzipSync(decoded);
+    }
+    if (encoding === "deflate") return inflateSync(decoded);
+    return decoded;
+  }, body);
+}
+
+function bodyToUtf8(
+  body: Buffer,
+  contentEncoding: string | string[] | undefined,
+): string {
+  try {
+    return decodeCapturedBody(body, contentEncoding)
+      .toString("utf-8")
+      .substring(0, MAX_BODY_SIZE);
+  } catch {
+    return body.toString("utf-8").substring(0, MAX_BODY_SIZE);
+  }
+}
 
 /**
  * MitmProxyServer — An embedded HTTP/HTTPS man-in-the-middle proxy.
@@ -65,6 +109,10 @@ export class MitmProxyServer extends EventEmitter {
 
     this.server.on("connect", (req, clientSocket, head) => {
       this.handleConnect(req, clientSocket, head);
+    });
+
+    this.server.on("upgrade", (req, socket, head) => {
+      this.handleHttpWebSocketUpgrade(req, socket as net.Socket, head);
     });
 
     this.server.on("connection", (socket) => {
@@ -239,21 +287,167 @@ export class MitmProxyServer extends EventEmitter {
 
   // ---- HTTP (non-CONNECT) proxy ----
 
+  /**
+   * Handle plain HTTP WebSocket upgrade (ws://) from the main server.
+   */
+  private handleHttpWebSocketUpgrade(
+    clientReq: http.IncomingMessage,
+    clientSocket: net.Socket,
+    head: Buffer,
+  ): void {
+    const startTime = Date.now();
+    const requestId = `proxy-${uuidv4()}`;
+    const targetUrl = clientReq.url || "/";
+    const parsed = url.parse(targetUrl);
+    const hostname = parsed.hostname || "localhost";
+    const port = parseInt(parsed.port || "80", 10);
+    const fullUrl = targetUrl.startsWith("http") ? targetUrl : `ws://${hostname}:${port}${parsed.path || "/"}`;
+
+    const connectToServer = (serverSocket: net.Socket): void => {
+      const wsHostHeader = port !== 80 ? `${hostname}:${port}` : hostname;
+      const headers = { ...clientReq.headers, host: wsHostHeader };
+      let rawReq = `${clientReq.method} ${parsed.path || "/"} HTTP/1.1\r\n`;
+      for (const [key, val] of Object.entries(headers)) {
+        if (val === undefined) continue;
+        const values = Array.isArray(val) ? val : [val];
+        for (const v of values) {
+          rawReq += `${key}: ${v}\r\n`;
+        }
+      }
+      rawReq += "\r\n";
+
+      serverSocket.write(rawReq);
+      if (head.length > 0) serverSocket.write(head);
+
+      let responseBuf = Buffer.alloc(0);
+      const onData = (chunk: Buffer): void => {
+        responseBuf = Buffer.concat([responseBuf, chunk]);
+        const headerEnd = responseBuf.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return;
+
+        serverSocket.removeListener("data", onData);
+
+        const responseHeader = responseBuf.subarray(0, headerEnd + 4);
+        const trailing = responseBuf.subarray(headerEnd + 4);
+
+        const firstLine = responseHeader.toString("utf-8").split("\r\n")[0];
+        const statusCode = parseInt(firstLine.split(" ")[1], 10) || 101;
+
+        clientSocket.write(responseHeader);
+        if (trailing.length > 0) clientSocket.write(trailing);
+
+        serverSocket.pipe(clientSocket);
+        clientSocket.pipe(serverSocket);
+
+        serverSocket.on("error", () => clientSocket.destroy());
+        clientSocket.on("error", () => serverSocket.destroy());
+        serverSocket.on("close", () => clientSocket.destroy());
+        clientSocket.on("close", () => serverSocket.destroy());
+
+        this.emit("response-captured", {
+          requestId,
+          method: clientReq.method || "GET",
+          url: fullUrl,
+          requestHeaders: JSON.stringify(clientReq.headers || {}),
+          requestBody: null,
+          statusCode,
+          responseHeaders: JSON.stringify(this.parseRawHeaders(responseHeader.toString("utf-8"))),
+          responseBody: null,
+          contentType: null,
+          initiator: null,
+          durationMs: Date.now() - startTime,
+          isOptions: false,
+          isStatic: false,
+          isStreaming: false,
+          isWebSocket: true,
+          truncated: false,
+          timestamp: startTime,
+        });
+      };
+
+      serverSocket.on("data", onData);
+    };
+
+    if (this.upstreamProxy) {
+      this.connectToTarget(hostname, port)
+        .then(connectToServer)
+        .catch((err) => {
+          console.warn("[MitmProxy] WS upstream proxy error:", err.message);
+          clientSocket.destroy();
+        });
+    } else {
+      const serverSocket = net.connect(port, hostname, () => {
+        connectToServer(serverSocket);
+      });
+      serverSocket.on("error", (err) => {
+        console.warn(`[MitmProxy] WS connect error for ${hostname}:`, err.message);
+        clientSocket.destroy();
+      });
+    }
+  }
+
+  /**
+   * Check if a request targets the proxy itself (direct browser access or
+   * proxy-configured client navigating to the proxy's own address).
+   * In both cases we serve the certificate download page.
+   */
+  private isSelfRequest(reqUrl: string, host: string): boolean {
+    // Case 1: Direct browser access (non-proxy request) — URL is a relative path
+    if (!reqUrl || (!reqUrl.startsWith("http://") && !reqUrl.startsWith("https://"))) {
+      return true;
+    }
+    // Case 2: Proxy client navigates to the proxy's own address
+    if (this.port !== null) {
+      const parsed = url.parse(reqUrl);
+      const targetPort = parseInt(parsed.port || "80", 10);
+      if (targetPort === this.port) {
+        const targetHost = (parsed.hostname || "").toLowerCase();
+        // Check common local identifiers
+        if (targetHost === "localhost" || targetHost === "127.0.0.1" || targetHost === "0.0.0.0") {
+          return true;
+        }
+        // Check against local network interfaces
+        const nets = networkInterfaces();
+        for (const name of Object.keys(nets)) {
+          for (const iface of nets[name] || []) {
+            if (iface.address === targetHost) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   private handleHttpRequest(
     clientReq: http.IncomingMessage,
     clientRes: http.ServerResponse,
   ): void {
+    // Intercept cert download page requests
+    const host = (clientReq.headers.host || "").split(":")[0];
+    const targetUrl = clientReq.url || "";
+    const parsedTarget = url.parse(targetUrl);
+    const targetHost = (parsedTarget.hostname || "").split(":")[0];
+    if (isCertDownloadHost(host) || isCertDownloadHost(targetHost)) {
+      this.serveCertPage(clientReq, clientRes);
+      return;
+    }
+
+    // Direct browser access or self-referencing proxy request → serve cert page
+    if (this.isSelfRequest(targetUrl, host)) {
+      this.serveCertPage(clientReq, clientRes);
+      return;
+    }
+
     const startTime = Date.now();
     const requestId = `proxy-${uuidv4()}`;
 
-    const targetUrl = clientReq.url;
     if (!targetUrl) {
       clientRes.writeHead(400);
       clientRes.end("Bad Request");
       return;
     }
 
-    const parsed = url.parse(targetUrl);
+    const parsed = parsedTarget;
     const reqBodyChunks: Buffer[] = [];
     let reqBodySize = 0;
 
@@ -395,13 +589,6 @@ export class MitmProxyServer extends EventEmitter {
       return;
     }
 
-    // Check if this is a WebSocket upgrade — just tunnel through
-    const upgradeHeader = req.headers["upgrade"];
-    if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-      this.tunnelDirect(hostname, port, clientSocket, head);
-      return;
-    }
-
     // Acknowledge CONNECT
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
 
@@ -422,6 +609,11 @@ export class MitmProxyServer extends EventEmitter {
         decryptedReq,
         decryptedRes,
       );
+    });
+
+    // Handle WebSocket upgrade requests inside the TLS tunnel
+    miniServer.on("upgrade", (upgradeReq, upgradeSocket, upgradeHead) => {
+      this.handleWebSocketUpgrade(hostname, port, upgradeReq, upgradeSocket as net.Socket, upgradeHead);
     });
 
     // Pipe the TLS socket into the mini server
@@ -446,6 +638,12 @@ export class MitmProxyServer extends EventEmitter {
     clientReq: http.IncomingMessage,
     clientRes: http.ServerResponse,
   ): void {
+    // Serve cert download page over HTTPS too (LAN devices may access via HTTPS)
+    if (isCertDownloadHost(hostname)) {
+      this.serveCertPage(clientReq, clientRes);
+      return;
+    }
+
     const startTime = Date.now();
     const requestId = `proxy-${uuidv4()}`;
     const fullUrl = `https://${hostname}${port !== 443 ? ":" + port : ""}${clientReq.url || "/"}`;
@@ -478,6 +676,145 @@ export class MitmProxyServer extends EventEmitter {
   }
 
   /**
+   * Handle a WebSocket upgrade request received inside a decrypted TLS tunnel.
+   * Forwards the upgrade to the real server and pipes bidirectional frames.
+   */
+  private handleWebSocketUpgrade(
+    hostname: string,
+    port: number,
+    clientReq: http.IncomingMessage,
+    clientSocket: net.Socket,
+    head: Buffer,
+  ): void {
+    const startTime = Date.now();
+    const requestId = `proxy-${uuidv4()}`;
+    const fullUrl = `wss://${hostname}${port !== 443 ? ":" + port : ""}${clientReq.url || "/"}`;
+
+    const connectAndUpgrade = (targetSocket: net.Socket): void => {
+      // Perform TLS handshake with the real server
+      const tlsConnection = tls.connect(
+        {
+          host: hostname,
+          port,
+          socket: targetSocket,
+          rejectUnauthorized: false,
+          servername: hostname,
+        },
+        () => {
+          // Build the upgrade request to send to the real server
+          const wsHostHeader = port !== 443 ? `${hostname}:${port}` : hostname;
+          const headers = { ...clientReq.headers, host: wsHostHeader };
+          let rawReq = `${clientReq.method} ${clientReq.url} HTTP/1.1\r\n`;
+          for (const [key, val] of Object.entries(headers)) {
+            if (val === undefined) continue;
+            const values = Array.isArray(val) ? val : [val];
+            for (const v of values) {
+              rawReq += `${key}: ${v}\r\n`;
+            }
+          }
+          rawReq += "\r\n";
+
+          tlsConnection.write(rawReq);
+          if (head.length > 0) tlsConnection.write(head);
+
+          // Wait for the server's upgrade response
+          let responseBuf = Buffer.alloc(0);
+          const onData = (chunk: Buffer): void => {
+            responseBuf = Buffer.concat([responseBuf, chunk]);
+            const headerEnd = responseBuf.indexOf("\r\n\r\n");
+            if (headerEnd === -1) return;
+
+            tlsConnection.removeListener("data", onData);
+
+            const responseHeader = responseBuf.subarray(0, headerEnd + 4);
+            const trailing = responseBuf.subarray(headerEnd + 4);
+
+            // Parse status code from first line
+            const firstLine = responseHeader.toString("utf-8").split("\r\n")[0];
+            const statusCode = parseInt(firstLine.split(" ")[1], 10) || 101;
+
+            // Forward the server response header to the client
+            clientSocket.write(responseHeader);
+            if (trailing.length > 0) clientSocket.write(trailing);
+
+            // Pipe bidirectional WebSocket frames
+            tlsConnection.pipe(clientSocket);
+            clientSocket.pipe(tlsConnection);
+
+            tlsConnection.on("error", () => clientSocket.destroy());
+            clientSocket.on("error", () => tlsConnection.destroy());
+            tlsConnection.on("close", () => clientSocket.destroy());
+            clientSocket.on("close", () => tlsConnection.destroy());
+
+            // Emit capture event for the WebSocket upgrade request
+            this.emit("response-captured", {
+              requestId,
+              method: clientReq.method || "GET",
+              url: fullUrl,
+              requestHeaders: JSON.stringify(clientReq.headers || {}),
+              requestBody: null,
+              statusCode,
+              responseHeaders: JSON.stringify(this.parseRawHeaders(responseHeader.toString("utf-8"))),
+              responseBody: null,
+              contentType: null,
+              initiator: null,
+              durationMs: Date.now() - startTime,
+              isOptions: false,
+              isStatic: false,
+              isStreaming: false,
+              isWebSocket: true,
+              truncated: false,
+              timestamp: startTime,
+            });
+          };
+
+          tlsConnection.on("data", onData);
+        },
+      );
+
+      tlsConnection.on("error", (err) => {
+        console.warn(`[MitmProxy] WebSocket upstream TLS error for ${hostname}:`, err.message);
+        clientSocket.destroy();
+      });
+    };
+
+    if (this.upstreamProxy) {
+      this.connectToTarget(hostname, port)
+        .then(connectAndUpgrade)
+        .catch((err) => {
+          console.warn("[MitmProxy] WebSocket upstream proxy error:", err.message);
+          clientSocket.destroy();
+        });
+    } else {
+      const targetSocket = net.connect(port, hostname, () => {
+        connectAndUpgrade(targetSocket);
+      });
+      targetSocket.on("error", (err) => {
+        console.warn(`[MitmProxy] WebSocket connect error for ${hostname}:`, err.message);
+        clientSocket.destroy();
+      });
+    }
+  }
+
+  /**
+   * Parse raw HTTP response headers into a key-value object.
+   */
+  private parseRawHeaders(raw: string): Record<string, string> {
+    const headers: Record<string, string> = {};
+    const lines = raw.split("\r\n").slice(1); // skip status line
+    for (const line of lines) {
+      if (!line) break;
+      const colonIdx = line.indexOf(":");
+      if (colonIdx > 0) {
+        const key = line.substring(0, colonIdx).trim().toLowerCase();
+        const value = line.substring(colonIdx + 1).trim();
+        headers[key] = value;
+      }
+    }
+    return headers;
+  }
+
+  /**
    * Direct HTTPS request to the target (no upstream proxy).
    */
   private handleDecryptedDirect(
@@ -490,12 +827,13 @@ export class MitmProxyServer extends EventEmitter {
     reqBody: Buffer,
     fullUrl: string,
   ): void {
+    const hostHeader = port !== 443 ? `${hostname}:${port}` : hostname;
     const options: https.RequestOptions = {
       hostname,
       port,
       path: clientReq.url,
       method: clientReq.method,
-      headers: { ...clientReq.headers, host: hostname },
+      headers: { ...clientReq.headers, host: hostHeader },
       rejectUnauthorized: false, // We are the MITM — upstream cert check is lax
     };
 
@@ -532,12 +870,13 @@ export class MitmProxyServer extends EventEmitter {
     try {
       const tunnelSocket = await this.connectToTarget(hostname, port);
 
+      const hostHeader = port !== 443 ? `${hostname}:${port}` : hostname;
       const options: https.RequestOptions = {
         hostname,
         port,
         path: clientReq.url,
         method: clientReq.method,
-        headers: { ...clientReq.headers, host: hostname },
+        headers: { ...clientReq.headers, host: hostHeader },
         rejectUnauthorized: false,
         socket: tunnelSocket, // Use the pre-established tunnel
       };
@@ -606,7 +945,7 @@ export class MitmProxyServer extends EventEmitter {
 
       const isStreaming =
         contentType?.includes("text/event-stream") || false;
-      const isWebSocket = false; // WebSocket is tunneled, not intercepted
+      const isWebSocket = false; // Regular HTTP/HTTPS — WS upgrade is handled separately
       const isOptions = method === "OPTIONS";
       const isStatic = STATIC_EXTENSIONS.test(fullUrl);
 
@@ -615,12 +954,12 @@ export class MitmProxyServer extends EventEmitter {
 
       const requestBody =
         reqBody.length > 0 && !isBinary
-          ? reqBody.toString("utf-8").substring(0, MAX_BODY_SIZE)
+          ? bodyToUtf8(reqBody, clientReq.headers["content-encoding"])
           : null;
 
       const responseBody =
         resBody.length > 0 && !isBinary
-          ? resBody.toString("utf-8").substring(0, MAX_BODY_SIZE)
+          ? bodyToUtf8(resBody, proxyRes.headers["content-encoding"])
           : null;
 
       this.emit("response-captured", {
@@ -685,5 +1024,62 @@ export class MitmProxyServer extends EventEmitter {
       serverSocket.on("error", () => clientSocket.destroy());
       clientSocket.on("error", () => serverSocket.destroy());
     }
+  }
+
+  // ---- Certificate download page ----
+
+  /**
+   * Serve the certificate download page or the certificate file itself
+   * when a client accesses the certificate hostnames.
+   */
+  private serveCertPage(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): void {
+    const reqPath = url.parse(req.url || "/").pathname || "/";
+
+    if (reqPath === "/cert.crt" || reqPath === "/cert.pem" || reqPath === "/cert.cer") {
+      // Serve the CA certificate file for download
+      try {
+        // .cer → DER (binary) format for mobile compatibility
+        // .crt / .pem → PEM (text) format
+        const isDer = reqPath === "/cert.cer";
+        const certContent = isDer
+          ? getCertDerContent(this.caManager)
+          : getCertFileContent(this.caManager);
+        const contentType = isDer
+          ? "application/x-x509-ca-cert"
+          : "application/x-pem-file";
+        const filename = isDer
+          ? "anything-analyzer-ca.cer"
+          : "anything-analyzer-ca.pem";
+        res.writeHead(200, {
+          "Content-Type": contentType,
+          "Content-Disposition": `attachment; filename=\"${filename}\"`,
+          "Content-Length": certContent.length,
+          "Cache-Control": "no-cache",
+        });
+        res.end(certContent);
+      } catch (err) {
+        console.error("[MitmProxy] Failed to read CA cert:", err);
+        res.writeHead(500);
+        res.end("CA certificate not available. Please initialize the proxy first.");
+      }
+      return;
+    }
+
+    // Serve the HTML download page.
+    // Use the request's Host header for the download link so it works on
+    // LAN devices that access the proxy directly by IP (not via cert.anything.test).
+    const ua = req.headers["user-agent"] || "";
+    const reqHost = req.headers.host || "";
+    const html = isCertDownloadHost(reqHost.split(":")[0])
+      ? generateCertPage(ua)
+      : generateCertPage(ua, reqHost);
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(html);
   }
 }

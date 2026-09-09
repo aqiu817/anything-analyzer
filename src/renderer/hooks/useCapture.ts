@@ -5,19 +5,26 @@ import type {
   StorageSnapshot,
   AnalysisReport,
   ChatMessage,
+  InteractionEvent,
 } from "@shared/types";
 import { IPC_CHANNELS } from "@shared/types";
+import {
+  findLatestConversationTokenUsage,
+  type ConversationTokenUsage,
+} from "@shared/token-estimate";
 
-interface UseCaptureState {
+export interface UseCaptureState {
   requests: CapturedRequest[];
   hooks: JsHookRecord[];
   snapshots: StorageSnapshot[];
   reports: AnalysisReport[];
+  interactions: InteractionEvent[];
   isAnalyzing: boolean;
   analysisError: string | null;
   streamingContent: string;
   selectedRequest: CapturedRequest | null;
   chatHistory: ChatMessage[];
+  latestContextUsage: ConversationTokenUsage | null;
   isChatting: boolean;
   chatError: string | null;
 }
@@ -27,43 +34,63 @@ interface UseCaptureReturn extends UseCaptureState {
   clearData: () => void;
   clearCaptureData: (sessionId: string) => Promise<void>;
   selectRequest: (request: CapturedRequest | null) => void;
-  startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[]) => Promise<void>;
+  startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => Promise<void>;
   cancelAnalysis: (sessionId: string) => Promise<void>;
   sendFollowUp: (sessionId: string, message: string) => Promise<void>;
 }
 
-const INITIAL_STATE: UseCaptureState = {
+export const INITIAL_CAPTURE_STATE: UseCaptureState = {
   requests: [],
   hooks: [],
   snapshots: [],
   reports: [],
+  interactions: [],
   isAnalyzing: false,
   analysisError: null,
   streamingContent: "",
   selectedRequest: null,
   chatHistory: [],
+  latestContextUsage: null,
   isChatting: false,
   chatError: null,
 };
 
+export function prepareStateForAnalysis(prev: UseCaptureState): UseCaptureState {
+  return {
+    ...prev,
+    reports: [],
+    chatHistory: [],
+    latestContextUsage: null,
+    isAnalyzing: true,
+    isChatting: false,
+    analysisError: null,
+    chatError: null,
+    streamingContent: "",
+  };
+}
+
 export function useCapture(sessionId: string | null): UseCaptureReturn {
-  const [state, setState] = useState<UseCaptureState>(INITIAL_STATE);
+  const [state, setState] = useState<UseCaptureState>(INITIAL_CAPTURE_STATE);
   const sessionIdRef = useRef(sessionId);
+  const conversationVersionRef = useRef(0);
 
   // Keep ref in sync for use in callbacks
   useEffect(() => {
     sessionIdRef.current = sessionId;
+    conversationVersionRef.current += 1;
   }, [sessionId]);
 
   // Clear all data
   const clearData = useCallback(() => {
-    setState(INITIAL_STATE);
+    conversationVersionRef.current += 1;
+    setState(INITIAL_CAPTURE_STATE);
   }, []);
 
   // Clear all capture data from DB and reset local state
   const clearCaptureData = useCallback(async (sid: string) => {
     await window.electronAPI.clearCaptureData(sid);
-    setState(INITIAL_STATE);
+    conversationVersionRef.current += 1;
+    setState(INITIAL_CAPTURE_STATE);
   }, []);
 
   // Select a request for detail view
@@ -73,18 +100,23 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
   // Load all data for a session from main process
   const loadData = useCallback(async (sid: string) => {
+    const conversationVersion = conversationVersionRef.current;
     try {
-      const [requests, hooks, snapshots, reports] = await Promise.all([
+      const [requests, hooks, snapshots, reports, interactions, aiRequestLogs] = await Promise.all([
         window.electronAPI.getRequests(sid),
         window.electronAPI.getHooks(sid),
         window.electronAPI.getStorage(sid),
         window.electronAPI.getReports(sid),
+        window.electronAPI.getInteractions(sid),
+        window.electronAPI.getAiRequestLogs(sid),
       ]);
+      const sortedReports = [...reports].sort((a, b) => b.created_at - a.created_at);
+      const latestReport = sortedReports[0] ?? null;
+      const latestContextUsage = findLatestConversationTokenUsage(aiRequestLogs, latestReport);
 
       // Restore chat history for the latest report
       let chatHistory: ChatMessage[] = [];
-      if (reports.length > 0) {
-        const latestReport = reports.sort((a, b) => b.created_at - a.created_at)[0];
+      if (latestReport) {
         const savedMessages = await window.electronAPI.getChatMessages(latestReport.id);
         if (savedMessages.length > 0) {
           chatHistory = savedMessages as ChatMessage[];
@@ -121,14 +153,16 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
       }
 
       // Only update if session hasn't changed while loading
-      if (sessionIdRef.current === sid) {
+      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
         setState((prev) => ({
           ...prev,
           requests: requests.sort((a, b) => a.sequence - b.sequence),
           hooks: hooks.sort((a, b) => b.timestamp - a.timestamp),
           snapshots,
-          reports: reports.sort((a, b) => b.created_at - a.created_at),
+          reports: sortedReports,
+          interactions: (interactions || []).sort((a, b) => a.sequence - b.sequence),
           chatHistory,
+          latestContextUsage,
         }));
       }
     } catch (err) {
@@ -137,19 +171,16 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
   }, []);
 
   // Start AI analysis for a session
-  const startAnalysis = useCallback(async (sid: string, purpose?: string, selectedSeqs?: number[]) => {
-    setState((prev) => ({
-      ...prev,
-      isAnalyzing: true,
-      analysisError: null,
-      streamingContent: "",
-    }));
+  const startAnalysis = useCallback(async (sid: string, purpose?: string, selectedSeqs?: number[], model?: string) => {
+    const conversationVersion = conversationVersionRef.current + 1;
+    conversationVersionRef.current = conversationVersion;
+    setState(prepareStateForAnalysis);
 
     try {
-      const report = await window.electronAPI.startAnalysis(sid, purpose, selectedSeqs);
+      const report = await window.electronAPI.startAnalysis(sid, purpose, selectedSeqs, model);
 
       // Only update if session hasn't changed
-      if (sessionIdRef.current === sid) {
+      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
         // Build context summary from captured data for follow-up chat
         // (read current state synchronously via a mini-setState that returns prev unchanged)
         let systemContent = '';
@@ -185,6 +216,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
             streamingContent: "",
             reports: [report, ...prev.reports],
             chatHistory,
+            latestContextUsage: null,
             chatError: null,
           }
         });
@@ -199,7 +231,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
       console.error("Analysis failed:", err);
       const errMsg = err instanceof Error ? err.message : String(err);
       const isCancelled = errMsg.includes("Analysis cancelled") || errMsg.includes("aborted");
-      if (sessionIdRef.current === sid) {
+      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
         setState((prev) => ({
           ...prev,
           isAnalyzing: false,
@@ -212,6 +244,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
   // Cancel an in-progress analysis
   const cancelAnalysis = useCallback(async (sid: string) => {
+    conversationVersionRef.current += 1;
     await window.electronAPI.cancelAnalysis(sid);
     setState((prev) => ({
       ...prev,
@@ -227,11 +260,17 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
   }, [state.chatHistory]);
 
   const sendFollowUp = useCallback(async (sid: string, message: string) => {
+    const conversationVersion = conversationVersionRef.current;
     // Get the latest report ID for persisting chat messages
     let currentReportId = '';
+    let currentReportScope: Pick<AnalysisReport, 'id' | 'created_at'> | null = null;
     setState((prev) => {
       if (prev.reports.length > 0) {
         currentReportId = prev.reports[0].id;
+        currentReportScope = {
+          id: prev.reports[0].id,
+          created_at: prev.reports[0].created_at,
+        };
       }
       return {
         ...prev,
@@ -244,24 +283,32 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
     try {
       const reply = await window.electronAPI.sendFollowUp(sid, currentReportId, chatHistoryRef.current, message);
+      const latestContextUsage = await window.electronAPI.getAiRequestLogs(sid)
+        .then((logs) => findLatestConversationTokenUsage(logs, currentReportScope))
+        .catch(() => null);
 
-      if (sessionIdRef.current === sid) {
+      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
         setState((prev) => ({
           ...prev,
           isChatting: false,
           streamingContent: "",
           chatHistory: [...prev.chatHistory, { role: 'assistant' as const, content: reply }],
+          latestContextUsage: latestContextUsage ?? prev.latestContextUsage,
         }));
       }
     } catch (err) {
       console.error("Follow-up chat failed:", err);
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (sessionIdRef.current === sid) {
+      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
         setState((prev) => ({
           ...prev,
           isChatting: false,
           streamingContent: "",
           chatError: errMsg,
+          // Roll back the optimistically added user message on failure
+          chatHistory: prev.chatHistory.length > 0 && prev.chatHistory[prev.chatHistory.length - 1]?.role === 'user'
+            ? prev.chatHistory.slice(0, -1)
+            : prev.chatHistory,
         }));
       }
     }
@@ -319,10 +366,13 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
     // Listen for analysis progress (streaming chunks)
     const handleAnalysisProgress = (chunk: string) => {
-      setState((prev) => ({
-        ...prev,
-        streamingContent: prev.streamingContent + chunk,
-      }));
+      setState((prev) => {
+        if (!prev.isAnalyzing && !prev.isChatting) return prev;
+        return {
+          ...prev,
+          streamingContent: prev.streamingContent + chunk,
+        };
+      });
     };
 
     window.electronAPI.onRequestCaptured(handleRequest);
@@ -330,14 +380,32 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     window.electronAPI.onStorageCaptured(handleStorage);
     window.electronAPI.onAnalysisProgress(handleAnalysisProgress);
 
+    // Listen for interaction recording events (debounced to avoid excessive DB queries)
+    let interactionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+    window.electronAPI.onInteractionRecorded(() => {
+      if (interactionDebounceTimer) clearTimeout(interactionDebounceTimer);
+      interactionDebounceTimer = setTimeout(() => {
+        if (sessionIdRef.current) {
+          window.electronAPI.getInteractions(sessionIdRef.current).then((interactions: InteractionEvent[]) => {
+            setState((prev) => ({
+              ...prev,
+              interactions: (interactions || []).sort((a, b) => a.sequence - b.sequence),
+            }));
+          }).catch(() => {});
+        }
+      }, 500);
+    });
+
     // Cleanup listeners on unmount or session change
     return () => {
       if (flushTimer) clearInterval(flushTimer);
+      if (interactionDebounceTimer) clearTimeout(interactionDebounceTimer);
       flush(); // flush remaining buffered items
       window.electronAPI.removeAllListeners(IPC_CHANNELS.CAPTURE_REQUEST);
       window.electronAPI.removeAllListeners(IPC_CHANNELS.CAPTURE_HOOK);
       window.electronAPI.removeAllListeners(IPC_CHANNELS.CAPTURE_STORAGE);
       window.electronAPI.removeAllListeners(IPC_CHANNELS.AI_PROGRESS);
+      window.electronAPI.removeAllListeners('interaction:recorded');
     };
   }, [sessionId, loadData, clearData]);
 

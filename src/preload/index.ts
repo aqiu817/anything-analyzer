@@ -7,6 +7,9 @@ window.addEventListener("message", (event) => {
   if (event.data?.type === "ar-hook") {
     ipcRenderer.send("capture:hook-data", event.data);
   }
+  if (event.data?.type === "ar-interaction") {
+    ipcRenderer.send("capture:hook-data", event.data);
+  }
 });
 
 // Expose IPC APIs to renderer
@@ -41,6 +44,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("browser:setRatio", ratio),
   setTargetViewVisible: (visible: boolean) =>
     ipcRenderer.invoke("browser:setVisible", visible),
+  toggleDevTools: () => ipcRenderer.invoke("browser:toggleDevTools"),
   exportFile: (defaultName: string, content: string) =>
     ipcRenderer.invoke("dialog:exportFile", defaultName, content),
 
@@ -65,8 +69,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("data:clear", sessionId),
 
   // AI analysis
-  startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[]) =>
-    ipcRenderer.invoke("ai:analyze", sessionId, purpose, selectedSeqs),
+  startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) =>
+    ipcRenderer.invoke("ai:analyze", sessionId, purpose, selectedSeqs, model),
   cancelAnalysis: (sessionId: string) =>
     ipcRenderer.invoke("ai:cancel", sessionId),
   sendFollowUp: (sessionId: string, reportId: string, history: unknown[], userMessage: string) =>
@@ -88,6 +92,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getLLMConfig: () => ipcRenderer.invoke("settings:getLLM"),
   saveLLMConfig: (config: unknown) =>
     ipcRenderer.invoke("settings:saveLLM", config),
+  listLLMModels: (config?: unknown) =>
+    ipcRenderer.invoke("settings:listModels", config),
 
   // Auto update
   getAppVersion: () => ipcRenderer.invoke("app:version"),
@@ -145,6 +151,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
   enableMitmSystemProxy: () => ipcRenderer.invoke("mitm-proxy:enableSystemProxy"),
   disableMitmSystemProxy: () => ipcRenderer.invoke("mitm-proxy:disableSystemProxy"),
 
+  // Interaction Recording
+  getInteractions: (sessionId: string, limit?: number) =>
+    ipcRenderer.invoke("interaction:getEvents", sessionId, limit),
+  getInteractionCount: (sessionId: string) =>
+    ipcRenderer.invoke("interaction:getCount", sessionId),
+  clearInteractions: (sessionId: string) =>
+    ipcRenderer.invoke("interaction:clear", sessionId),
+  onInteractionRecorded: (callback: (data: unknown) => void) => {
+    ipcRenderer.on("interaction:recorded", (_event, data) => callback(data));
+  },
+
   // Fingerprint
   getFingerprintProfile: (sessionId: string) =>
     ipcRenderer.invoke("fingerprint:get", sessionId),
@@ -184,6 +201,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onAnalysisProgress: (callback: (chunk: string) => void) => {
     ipcRenderer.on("ai:progress", (_event, chunk) => callback(chunk));
   },
+
+  // Log files
+  getLogPath: () => ipcRenderer.invoke("log:getPath"),
+  openLogFolder: () => ipcRenderer.invoke("log:openFolder"),
+  exportLogs: () => ipcRenderer.invoke("log:export"),
+
   removeAllListeners: (channel: string) => {
     ipcRenderer.removeAllListeners(channel);
   },

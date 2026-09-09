@@ -1,13 +1,15 @@
 import { v4 as uuidv4 } from "uuid";
 import { ipcMain, session as electronSession } from "electron";
 import type { WebContents, Session as ElectronSession } from "electron";
-import type { Session, ProxyConfig } from "@shared/types";
+import type { Session, ProxyConfig, RawInteractionData } from "@shared/types";
 import type { SessionsRepo } from "../db/repositories";
 import type { TabManager } from "../tab-manager";
 import { CdpManager } from "../cdp/cdp-manager";
 import { CaptureEngine } from "../capture/capture-engine";
 import { JsInjector } from "../capture/js-injector";
 import { StorageCollector } from "../capture/storage-collector";
+import { InteractionRecorder } from "../capture/interaction-recorder";
+import type { InteractionEventsRepo } from "../db/repositories";
 import type { ProfileStore } from '../fingerprint/profile-store';
 import { buildStealthScript } from '../../preload/stealth-script';
 import { applyHttpSpoofing, removeHttpSpoofing } from '../fingerprint/http-spoofing';
@@ -39,6 +41,12 @@ export class SessionManager {
   private hookIpcHandler:
     | ((event: Electron.IpcMainEvent, data: unknown) => void)
     | null = null;
+  /** Interaction recording IPC handler */
+  private interactionIpcHandler:
+    | ((event: Electron.IpcMainEvent, data: unknown) => void)
+    | null = null;
+  /** Per-session interaction recorder instance */
+  private interactionRecorder: InteractionRecorder | null = null;
   /** TabManager event listeners */
   private tabCreatedHandler:
     | ((tabInfo: { id: string; url: string; title: string }) => void)
@@ -58,6 +66,7 @@ export class SessionManager {
     private sessionsRepo: SessionsRepo,
     private captureEngine: CaptureEngine,
     private profileStore?: ProfileStore,
+    private interactionEventsRepo?: InteractionEventsRepo,
   ) {}
 
   // =============================================
@@ -91,12 +100,12 @@ export class SessionManager {
       await elSession.setProxy({ mode: "direct" });
       return;
     }
-    const auth =
-      config.username && config.password
-        ? `${config.username}:${config.password}@`
-        : "";
+
+    // Chromium proxyRules do NOT support inline credentials (user:pass@host)
+    // — that causes ERR_NO_SUPPORTED_PROXIES. Use plain host:port instead.
+    // Proxy auth is handled via app.on('login') in index.ts.
     await elSession.setProxy({
-      proxyRules: `${config.type}://${auth}${config.host}:${config.port}`,
+      proxyRules: `${config.type}://${config.host}:${config.port}`,
     });
   }
 
@@ -172,6 +181,10 @@ export class SessionManager {
     this.currentSessionId = sessionId;
     this.tabManager = tabManager;
 
+    // Publish the state transition before any optional capture setup. The renderer
+    // must never wait for a CDP debugger attach before enabling Pause/Stop.
+    this.sessionsRepo.updateStatus(sessionId, "running");
+
     // Start capture engine
     this.captureEngine.start(sessionId, rendererWebContents);
 
@@ -205,15 +218,66 @@ export class SessionManager {
     };
     ipcMain.on("capture:hook-data", this.hookIpcHandler);
 
-    // Attach capture pipelines to all existing tabs
+    // Register interaction recording IPC handler
+    if (this.interactionEventsRepo) {
+      this.interactionRecorder = new InteractionRecorder(this.interactionEventsRepo);
+      this.interactionIpcHandler = (_event, data) => {
+        const msg = data as { type: string } & Record<string, unknown>;
+        if (msg.type === 'ar-interaction') {
+          this.interactionRecorder?.handleInteraction({
+            type: msg.interactionType as RawInteractionData['type'],
+            timestamp: msg.timestamp as number,
+            x: msg.x as number | undefined,
+            y: msg.y as number | undefined,
+            viewportX: msg.viewportX as number | undefined,
+            viewportY: msg.viewportY as number | undefined,
+            selector: msg.selector as string | undefined,
+            xpath: msg.xpath as string | undefined,
+            tagName: msg.tagName as string | undefined,
+            elementText: msg.elementText as string | undefined,
+            attributes: msg.attributes as Record<string, string> | undefined,
+            boundingRect: msg.boundingRect as RawInteractionData['boundingRect'],
+            inputValue: msg.inputValue as string | undefined,
+            key: msg.key as string | undefined,
+            scrollX: msg.scrollX as number | undefined,
+            scrollY: msg.scrollY as number | undefined,
+            scrollDX: msg.scrollDX as number | undefined,
+            scrollDY: msg.scrollDY as number | undefined,
+            url: msg.url as string,
+            pageTitle: msg.pageTitle as string | undefined,
+            path: msg.path as RawInteractionData['path'],
+          });
+        }
+      };
+      ipcMain.on("capture:hook-data", this.interactionIpcHandler);
+    }
+
+    // Start interaction recorder (before tab attachment so injectIntoWebContents works)
+    if (this.interactionRecorder) {
+      this.interactionRecorder.start(sessionId, rendererWebContents);
+    }
+
+    // Mark the session running BEFORE optional CDP/injection setup.  On Windows
+    // debugger attachment can take a long time (or be held by another debugger);
+    // keeping this update at the end made the renderer look like Start did
+    // nothing and left Pause/Stop disabled indefinitely.
+    this.sessionsRepo.updateStatus(sessionId, "running");
+
+    // Attach capture pipelines in the background.  A failing or slow tab must
+    // not block the capture state machine or make the control buttons inert;
+    // proxy capture remains available while a browser tab retries/gets skipped.
     for (const tab of tabManager.getAllTabs()) {
-      await this.attachCaptureToTab(tab.id, tab.view.webContents);
+      if (!tab.view.webContents.isDestroyed()) {
+        void this.attachCaptureToTab(tab.id, tab.view.webContents).catch((err) => {
+          console.warn(`[SessionManager] Capture attach failed for tab ${tab.id}:`, (err as Error).message);
+        });
+      }
     }
 
     // Auto-attach to new tabs
     this.tabCreatedHandler = async (tabInfo) => {
       const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
-      if (tab) {
+      if (tab && !tab.view.webContents.isDestroyed()) {
         await this.attachCaptureToTab(tab.id, tab.view.webContents);
       }
     };
@@ -237,6 +301,13 @@ export class SessionManager {
     webContents: WebContents,
   ): Promise<void> {
     if (this.tabCaptures.has(tabId)) return;
+    if (webContents.isDestroyed()) return;
+
+    // Interaction recording does not require CDP. Attach it first so element
+    // actions remain available even when debugger attachment is unavailable.
+    if (this.interactionRecorder) {
+      await this.interactionRecorder.injectIntoWebContents(webContents);
+    }
 
     const cdp = new CdpManager();
     const injector = new JsInjector();
@@ -276,9 +347,9 @@ export class SessionManager {
       }
 
       // Also inject into current page immediately (for pages already loaded)
-      try {
-        webContents.executeJavaScript(stealthJs, true);
-      } catch { /* page not ready */ }
+      if (!webContents.isDestroyed()) {
+        webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready */ });
+      }
 
       stealthCleanup = () => {
         // CDP scripts are automatically removed when debugger detaches — no manual cleanup needed
@@ -322,6 +393,9 @@ export class SessionManager {
       await bundle.cdp.stop();
     }
 
+    // Pause interaction recorder
+    this.interactionRecorder?.pause();
+
     this.sessionsRepo.updateStatus(sessionId, "paused");
   }
 
@@ -340,9 +414,14 @@ export class SessionManager {
 
     if (this.tabManager) {
       for (const tab of this.tabManager.getAllTabs()) {
-        await this.attachCaptureToTab(tab.id, tab.view.webContents);
+        if (!tab.view.webContents.isDestroyed()) {
+          await this.attachCaptureToTab(tab.id, tab.view.webContents);
+        }
       }
     }
+
+    // Resume interaction recorder
+    this.interactionRecorder?.resume();
 
     this.sessionsRepo.updateStatus(sessionId, "running");
   }
@@ -373,6 +452,16 @@ export class SessionManager {
     if (this.hookIpcHandler) {
       ipcMain.removeListener("capture:hook-data", this.hookIpcHandler);
       this.hookIpcHandler = null;
+    }
+
+    // Stop interaction recorder
+    if (this.interactionIpcHandler) {
+      ipcMain.removeListener("capture:hook-data", this.interactionIpcHandler);
+      this.interactionIpcHandler = null;
+    }
+    if (this.interactionRecorder) {
+      this.interactionRecorder.stop();
+      this.interactionRecorder = null;
     }
 
     this.captureEngine.stop();
@@ -429,7 +518,10 @@ export class SessionManager {
     if (createdNew) {
       const session = this.sessionsRepo.findById(sessionId);
       if (session?.target_url) {
-        tabManager.getActiveWebContents()?.loadURL(session.target_url).catch(() => {});
+        const wc = tabManager.getActiveWebContents();
+        if (wc && !wc.isDestroyed()) {
+          wc.loadURL(session.target_url).catch(() => {});
+        }
       }
     }
 
@@ -440,13 +532,15 @@ export class SessionManager {
 
     // Attach stealth to all existing tabs
     for (const tab of tabManager.getAllTabs()) {
-      this.attachStealthListeners(tab.id, tab.view.webContents);
+      if (!tab.view.webContents.isDestroyed()) {
+        this.attachStealthListeners(tab.id, tab.view.webContents);
+      }
     }
 
     // Auto-attach/detach for new/closed tabs
     this.stealthTabCreatedHandler = (tabInfo) => {
       const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
-      if (tab) {
+      if (tab && !tab.view.webContents.isDestroyed()) {
         this.attachStealthListeners(tab.id, tab.view.webContents);
       }
     };
@@ -500,18 +594,17 @@ export class SessionManager {
     const stealthJs = buildStealthScript(JSON.stringify(profile));
 
     const onNavigate = () => {
-      try {
-        webContents.executeJavaScript(stealthJs, true);
-      } catch { /* page not ready or destroyed */ }
+      if (webContents.isDestroyed()) return;
+      webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready or destroyed */ });
     };
 
     webContents.on("did-navigate", onNavigate);
     webContents.on("did-navigate-in-page", onNavigate);
 
     // Also inject into the current page immediately
-    try {
-      webContents.executeJavaScript(stealthJs, true);
-    } catch { /* page not ready */ }
+    if (!webContents.isDestroyed()) {
+      webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready */ });
+    }
 
     this.stealthCleanups.set(tabId, () => {
       webContents.removeListener("did-navigate", onNavigate);
@@ -558,13 +651,15 @@ export class SessionManager {
 
     // Re-attach stealth to all tabs
     for (const tab of tabManager.getAllTabs()) {
-      this.attachStealthListeners(tab.id, tab.view.webContents);
+      if (!tab.view.webContents.isDestroyed()) {
+        this.attachStealthListeners(tab.id, tab.view.webContents);
+      }
     }
 
     // Re-register tab listeners
     this.stealthTabCreatedHandler = (tabInfo) => {
       const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
-      if (tab) {
+      if (tab && !tab.view.webContents.isDestroyed()) {
         this.attachStealthListeners(tab.id, tab.view.webContents);
       }
     };

@@ -111,6 +111,8 @@ export function runMigrations(db: Database.Database): void {
   migrateAddSourceColumn(db)
   migrateAddChatMessagesTable(db)
   migrateAddAiRequestLogsTable(db)
+  migrateBackfillAnthropicCachedInputTokens(db)
+  migrateAddInteractionEventsTable(db)
 }
 
 /**
@@ -191,5 +193,61 @@ export function migrateAddAiRequestLogsTable(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_ai_logs_session ON ai_request_logs(session_id);
     CREATE INDEX IF NOT EXISTS idx_ai_logs_created ON ai_request_logs(created_at);
+  `)
+}
+
+export function migrateBackfillAnthropicCachedInputTokens(db: Database.Database): void {
+  const validResponse = "CASE WHEN json_valid(response_body) THEN response_body ELSE '{}' END"
+  const inputTokens = `COALESCE(CAST(json_extract(${validResponse}, '$.usage.input_tokens') AS INTEGER), 0)`
+  const cacheCreationTokens = `COALESCE(CAST(json_extract(${validResponse}, '$.usage.cache_creation_input_tokens') AS INTEGER), 0)`
+  const cacheReadTokens = `COALESCE(CAST(json_extract(${validResponse}, '$.usage.cache_read_input_tokens') AS INTEGER), 0)`
+
+  db.exec(`
+    UPDATE ai_request_logs
+    SET prompt_tokens = ${inputTokens} + ${cacheCreationTokens} + ${cacheReadTokens}
+    WHERE error IS NULL
+      AND response_body IS NOT NULL
+      AND json_valid(response_body)
+      AND prompt_tokens = ${inputTokens}
+      AND (${cacheCreationTokens} > 0 OR ${cacheReadTokens} > 0)
+  `)
+}
+
+/**
+ * Migration 010: Add interaction_events table for recording user interactions
+ * Safe to call multiple times (uses IF NOT EXISTS).
+ */
+export function migrateAddInteractionEventsTable(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS interaction_events (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      sequence      INTEGER NOT NULL,
+      type          TEXT NOT NULL,
+      timestamp     INTEGER NOT NULL,
+      x             REAL,
+      y             REAL,
+      viewport_x    REAL,
+      viewport_y    REAL,
+      selector      TEXT,
+      xpath         TEXT,
+      tag_name      TEXT,
+      element_text  TEXT,
+      attributes    TEXT,
+      bounding_rect TEXT,
+      input_value   TEXT,
+      key           TEXT,
+      scroll_x      REAL,
+      scroll_y      REAL,
+      scroll_dx     REAL,
+      scroll_dy     REAL,
+      url           TEXT NOT NULL,
+      page_title    TEXT,
+      path          TEXT,
+      created_at    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_interactions_session ON interaction_events(session_id);
+    CREATE INDEX IF NOT EXISTS idx_interactions_session_seq ON interaction_events(session_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_interactions_type ON interaction_events(session_id, type);
   `)
 }

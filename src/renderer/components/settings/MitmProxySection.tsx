@@ -19,6 +19,7 @@ export default function MitmProxySection() {
   const [mitmSystemProxy, setMitmSystemProxy] = useState(false)
   const [mitmLoading, setMitmLoading] = useState(false)
   const [regenConfirmOpen, setRegenConfirmOpen] = useState(false)
+  const [localIPs, setLocalIPs] = useState<string[]>([])
 
   useEffect(() => {
     window.electronAPI.getMitmProxyConfig().then(config => {
@@ -32,6 +33,7 @@ export default function MitmProxySection() {
       setMitmCaInitialized(status.caInitialized)
       if (status.caInstalled !== undefined) setMitmCaInstalled(status.caInstalled)
       if (status.systemProxyEnabled !== undefined) setMitmSystemProxy(status.systemProxyEnabled)
+      if (status.localIPs) setLocalIPs(status.localIPs)
     })
   }, [])
 
@@ -212,19 +214,56 @@ export default function MitmProxySection() {
               <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
                 在外部浏览器/设备中配置 HTTP 代理为：
               </span>
-              <div style={{ marginTop: 4 }}>
-                <code style={{
-                  background: 'var(--color-surface)',
-                  padding: '2px 6px',
-                  borderRadius: 4,
-                  fontSize: 'var(--font-size-sm)',
-                  fontFamily: 'var(--font-mono)',
-                }}>
-                  http://localhost:{mitmPort}
-                </code>
+              <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                {localIPs.length > 0 ? localIPs.map(ip => (
+                  <code key={ip} style={{
+                    background: 'var(--color-surface)',
+                    padding: '2px 6px',
+                    borderRadius: 4,
+                    fontSize: 'var(--font-size-sm)',
+                    fontFamily: 'var(--font-mono)',
+                    userSelect: 'all',
+                  }}>
+                    {ip}:{mitmPort}
+                  </code>
+                )) : (
+                  <code style={{
+                    background: 'var(--color-surface)',
+                    padding: '2px 6px',
+                    borderRadius: 4,
+                    fontSize: 'var(--font-size-sm)',
+                    fontFamily: 'var(--font-mono)',
+                  }}>
+                    http://&lt;本机IP&gt;:{mitmPort}
+                  </code>
+                )}
               </div>
             </div>
           )}
+
+          {/* Mobile cert download hint */}
+          <div style={{
+            marginTop: 4,
+            padding: '8px 12px',
+            background: 'var(--color-info-bg, rgba(59,130,246,0.08))',
+            border: '1px solid var(--color-info-border, rgba(59,130,246,0.2))',
+            borderRadius: 4,
+            fontSize: 'var(--font-size-sm)',
+            color: 'var(--text-secondary)',
+            lineHeight: 1.6,
+          }}>
+            📱 手机安装证书：连接代理后，用浏览器访问{' '}
+            <code style={{
+              background: 'var(--color-surface)',
+              padding: '1px 5px',
+              borderRadius: 3,
+              fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--font-size-sm)',
+              userSelect: 'all',
+            }}>
+              http://cert.anything.test
+            </code>
+          </div>
         </>
       )}
 

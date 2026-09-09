@@ -18,9 +18,12 @@ import type {
   JsHooksRepo,
   StorageSnapshotsRepo,
   AnalysisReportsRepo,
+  InteractionEventsRepo,
 } from "../db/repositories";
-import type { ChatMessage } from "@shared/types";
+import type { ChatMessage, InteractionType } from "@shared/types";
 import { loadLLMConfig } from "../ipc";
+import { ReplayEngine } from "../capture/replay-engine";
+import { formatMCPServerUrl, normalizeMCPListenHost } from "./mcp-server-listen";
 
 interface MCPServerDeps {
   sessionManager: SessionManager;
@@ -30,6 +33,7 @@ interface MCPServerDeps {
   jsHooksRepo: JsHooksRepo;
   storageSnapshotsRepo: StorageSnapshotsRepo;
   reportsRepo: AnalysisReportsRepo;
+  interactionEventsRepo: InteractionEventsRepo;
 }
 
 let httpServer: Server | null = null;
@@ -39,6 +43,16 @@ const mcpServers = new Map<string, McpServer>();
 // Per-session chat history for chat_followup tool
 const chatHistories = new Map<string, ChatMessage[]>();
 let currentDeps: MCPServerDeps | null = null;
+
+/**
+ * Check if the body (single or batch JSON-RPC) contains an initialize request.
+ */
+function isInitRequest(body: unknown): boolean {
+  if (Array.isArray(body)) {
+    return body.some((msg) => isInitializeRequest(msg));
+  }
+  return isInitializeRequest(body);
+}
 
 /**
  * Create a new McpServer instance with tools and resources registered.
@@ -61,9 +75,11 @@ export async function initMCPServer(
   port: number,
   authEnabled: boolean = true,
   authToken: string = '',
+  hostInput: string = '0.0.0.0',
 ): Promise<void> {
   if (httpServer) await stopMCPServer();
 
+  const host = normalizeMCPListenHost(hostInput);
   currentDeps = deps;
 
   httpServer = createServer(
@@ -99,7 +115,7 @@ export async function initMCPServer(
         }
       }
 
-      const url = new URL(req.url || "/", `http://localhost:${port}`);
+      const url = new URL(req.url || "/", formatMCPServerUrl(host, port));
       if (url.pathname !== "/mcp") {
         res.writeHead(404);
         res.end("Not Found");
@@ -110,26 +126,25 @@ export async function initMCPServer(
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
         if (req.method === "DELETE") {
-          // Close session
           if (sessionId && transports.has(sessionId)) {
-            const transport = transports.get(sessionId)!;
-            await transport.close();
-            transports.delete(sessionId);
-            chatHistories.delete(sessionId);
+            // Delegate to transport so internal state is cleaned up properly
+            await transports.get(sessionId)!.handleRequest(req, res);
+          } else {
+            res.writeHead(sessionId ? 404 : 400);
+            res.end(JSON.stringify({ error: "Session not found" }));
           }
-          res.writeHead(200);
-          res.end();
           return;
         }
 
         if (req.method === "GET") {
-          // SSE stream for existing session
           if (sessionId && transports.has(sessionId)) {
             await transports.get(sessionId)!.handleRequest(req, res);
-            return;
+          } else {
+            res.writeHead(sessionId ? 404 : 400);
+            res.end(
+              JSON.stringify({ error: "Missing or invalid session ID" }),
+            );
           }
-          res.writeHead(400);
-          res.end("Missing or invalid session ID");
           return;
         }
 
@@ -138,17 +153,20 @@ export async function initMCPServer(
 
         if (sessionId && transports.has(sessionId)) {
           await transports.get(sessionId)!.handleRequest(req, res, body);
-        } else if (!sessionId && isInitializeRequest(body)) {
+        } else if (!sessionId && isInitRequest(body)) {
+          // Create per-session McpServer first so it can be captured in the callback
+          const sessionServer = createMcpServerInstance(currentDeps!);
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sid) => {
               transports.set(sid, transport);
+              // Store mcpServer here – sessionId is available now
+              mcpServers.set(sid, sessionServer);
             },
           });
           transport.onclose = () => {
             if (transport.sessionId) {
               transports.delete(transport.sessionId);
-              chatHistories.delete(transport.sessionId);
               const srv = mcpServers.get(transport.sessionId);
               if (srv) {
                 srv.close().catch(() => {});
@@ -156,19 +174,18 @@ export async function initMCPServer(
               }
             }
           };
-          const sessionServer = createMcpServerInstance(currentDeps!);
           await sessionServer.connect(transport);
-          // Store after connect so sessionId is available
-          if (transport.sessionId) {
-            mcpServers.set(transport.sessionId, sessionServer);
-          }
           await transport.handleRequest(req, res, body);
+        } else if (sessionId && !transports.has(sessionId)) {
+          // Session ID provided but transport is gone (e.g. server restarted)
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: "Session not found" }));
         } else {
           res.writeHead(400);
           res.end(
             JSON.stringify({
               error:
-                "Invalid request: missing session ID or not an initialize request",
+                "Bad request: missing session ID or not an initialize request",
             }),
           );
         }
@@ -182,9 +199,32 @@ export async function initMCPServer(
     },
   );
 
-  httpServer.listen(port, () => {
-    console.log(`[MCP Server] Listening on http://localhost:${port}/mcp`);
-  });
+  const server = httpServer;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => {
+        server.off("listening", onListening);
+        reject(error);
+      };
+      const onListening = (): void => {
+        server.off("error", onError);
+        resolve();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(port, host);
+    });
+    console.log(`[MCP Server] Listening on ${formatMCPServerUrl(host, port)}`);
+  } catch (error) {
+    httpServer = null;
+    currentDeps = null;
+    try {
+      server.close();
+    } catch {
+      // Server may fail before entering the listening state.
+    }
+    throw error;
+  }
 }
 
 /**
@@ -233,6 +273,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     jsHooksRepo,
     storageSnapshotsRepo,
     reportsRepo,
+    interactionEventsRepo,
   } = deps;
 
   // -- Session Management --
@@ -241,6 +282,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "list_sessions",
     {
       description: "List all analysis sessions",
+      inputSchema: z.object({}),
     },
     async () => {
       const sessions = sessionManager.listSessions();
@@ -351,6 +393,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "browser_back",
     {
       description: "Go back in the active browser tab",
+      inputSchema: z.object({}),
     },
     async () => {
       windowManager.goBack();
@@ -362,6 +405,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "browser_forward",
     {
       description: "Go forward in the active browser tab",
+      inputSchema: z.object({}),
     },
     async () => {
       windowManager.goForward();
@@ -373,6 +417,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "browser_reload",
     {
       description: "Reload the active browser tab",
+      inputSchema: z.object({}),
     },
     async () => {
       windowManager.reload();
@@ -414,6 +459,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "list_tabs",
     {
       description: "List all browser tabs with their URLs and titles",
+      inputSchema: z.object({}),
     },
     async () => {
       const tabManager = windowManager.getTabManager();
@@ -432,11 +478,13 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     {
       description:
         "Clear all browser data (cookies, localStorage, sessionStorage, cache). Current login state will be lost.",
+      inputSchema: z.object({}),
     },
     async () => {
       await session.defaultSession.clearStorageData();
       await session.defaultSession.clearCache();
-      windowManager.getTabManager()?.getActiveWebContents()?.reload();
+      const wc = windowManager.getTabManager()?.getActiveWebContents();
+      if (wc && !wc.isDestroyed()) wc.reload();
       return text({ success: true });
     },
   );
@@ -446,10 +494,11 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     {
       description:
         "Capture a screenshot of the current active browser tab. Returns a PNG image.",
+      inputSchema: z.object({}),
     },
     async () => {
       const webContents = windowManager.getTabManager()?.getActiveWebContents();
-      if (!webContents) throw new Error("Browser not ready");
+      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
       const image = await webContents.capturePage();
       const base64 = image.toPNG().toString("base64");
       return {
@@ -468,7 +517,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
         "See https://chromedevtools.github.io/devtools-protocol/ for available methods.",
       inputSchema: z.object({
         method: z.string().describe("CDP method name, e.g. 'Page.captureScreenshot', 'Runtime.evaluate', 'DOM.getDocument'"),
-        params: z.record(z.unknown()).optional().describe("CDP method parameters as a JSON object"),
+        params: z.record(z.string(), z.unknown()).optional().describe("CDP method parameters as a JSON object"),
       }),
     },
     async ({ method, params }) => {
@@ -631,6 +680,8 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
         undefined,
         selectedSeqs,
       );
+      // Reset chat history so next chat_followup uses the new report
+      chatHistories.delete(sessionId);
       return text({
         id: report.id,
         content: report.report_content,
@@ -680,13 +731,35 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
         // Load existing report as context
         const reports = reportsRepo.findBySession(sessionId);
         const lastReport = reports[reports.length - 1];
+
+        // Build system prompt with captured data summary (consistent with IPC path)
+        const requests = requestsRepo.findBySession(sessionId);
+        const hooks = jsHooksRepo.findBySession(sessionId);
+        const reqSummary = requests.slice(0, 50).map((r) => {
+          let path = r.url;
+          try { path = new URL(r.url).pathname; } catch { /* keep full url */ }
+          return `#${r.sequence} ${r.method} ${path} → ${r.status_code ?? '?'}`;
+        }).join('\n');
+
+        const hookSummary = hooks.length > 0
+          ? '\n\nDetected hooks:\n' + hooks.slice(0, 20).map((h) =>
+              `[${h.hook_type}] ${h.function_name}`
+            ).join('\n')
+          : '';
+
+        const contextBlock = reqSummary
+          ? `\n\n<captured_data_summary>\nCaptured ${requests.length} requests:\n${reqSummary}${requests.length > 50 ? `\n... and ${requests.length - 50} more` : ''}${hookSummary}\n</captured_data_summary>`
+          : '';
+
+        const systemContent = `你是一位网站协议分析专家。基于之前的分析报告和捕获数据，回答用户的追问。保持技术精确，用中文回复。\n\n你可以使用 get_request_detail 工具，通过传入请求序号(seq)来查看任意请求的完整详情（请求头、请求体、响应头、响应体）。当用户追问某个具体请求或需要更多细节时，请主动调用此工具获取数据。${contextBlock}`;
+
+        const initialHistory: ChatMessage[] = [
+          { role: "system" as const, content: systemContent },
+        ];
         if (lastReport) {
-          chatHistories.set(sessionId, [
-            { role: "assistant" as const, content: lastReport.report_content },
-          ]);
-        } else {
-          chatHistories.set(sessionId, []);
+          initialHistory.push({ role: "assistant" as const, content: lastReport.report_content });
         }
+        chatHistories.set(sessionId, initialHistory);
       }
 
       const history = chatHistories.get(sessionId)!;
@@ -696,6 +769,196 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
       history.push({ role: "assistant" as const, content: reply });
 
       return text({ reply });
+    },
+  );
+
+  // -- Interaction Recording --
+
+  const replayEngine = new ReplayEngine();
+
+  server.registerTool(
+    "get_interactions",
+    {
+      description:
+        "Get recorded user interaction events (clicks, inputs, scrolls, mouse movements) for a session. " +
+        "Returns element selectors, positions, input values, and timestamps.",
+      inputSchema: z.object({
+        sessionId: z.string().describe("Session ID"),
+        type: z.enum(['click', 'dblclick', 'input', 'scroll', 'navigate', 'hover']).optional().describe("Filter by interaction type"),
+        limit: z.number().default(100).describe("Max events to return"),
+      }),
+    },
+    async ({ sessionId, type, limit }) => {
+      const events = type
+        ? interactionEventsRepo.findBySessionAndType(sessionId, type as InteractionType)
+        : interactionEventsRepo.findBySession(sessionId, limit);
+      return text(events.slice(0, limit));
+    },
+  );
+
+  server.registerTool(
+    "get_interaction_summary",
+    {
+      description:
+        "Get a high-level summary of recorded interactions: action sequence, key elements, and navigation flow. " +
+        "Useful for understanding what the user did before asking AI to automate it.",
+      inputSchema: z.object({ sessionId: z.string() }),
+    },
+    async ({ sessionId }) => {
+      const events = interactionEventsRepo.findBySession(sessionId, 500);
+      if (events.length === 0) {
+        return text({ summary: "No interactions recorded for this session.", steps: [] });
+      }
+
+      // Generate human-readable summary
+      const steps: string[] = [];
+      let stepNum = 1;
+      for (const event of events) {
+        if (event.type === 'hover') continue; // skip movement in summary
+        let desc = '';
+        switch (event.type) {
+          case 'click':
+          case 'dblclick': {
+            const target = event.element_text || event.selector || `(${event.x}, ${event.y})`;
+            desc = `${event.type === 'dblclick' ? 'Double-click' : 'Click'} "${target}" [${event.tag_name || 'element'}]`;
+            break;
+          }
+          case 'input': {
+            const field = event.selector || event.tag_name || 'input';
+            desc = `Type "${event.input_value}" into ${field}`;
+            break;
+          }
+          case 'scroll': {
+            desc = `Scroll to (${event.scroll_x}, ${event.scroll_y})`;
+            break;
+          }
+          case 'navigate': {
+            desc = `Navigate to ${event.url}`;
+            break;
+          }
+        }
+        if (desc) {
+          steps.push(`${stepNum++}. ${desc}`);
+        }
+      }
+
+      return text({
+        totalEvents: events.length,
+        clickCount: events.filter(e => e.type === 'click' || e.type === 'dblclick').length,
+        inputCount: events.filter(e => e.type === 'input').length,
+        scrollCount: events.filter(e => e.type === 'scroll').length,
+        pagesVisited: [...new Set(events.map(e => e.url))],
+        steps,
+      });
+    },
+  );
+
+  server.registerTool(
+    "replay_interactions",
+    {
+      description:
+        "Replay recorded user interactions in the browser via CDP Input simulation. " +
+        "Reproduces clicks, inputs, scrolls in the original sequence.",
+      inputSchema: z.object({
+        sessionId: z.string().describe("Session ID with recorded interactions"),
+        speed: z.number().default(2).describe("Playback speed multiplier (2 = 2x faster)"),
+        fromSequence: z.number().optional().describe("Start from this sequence number"),
+        toSequence: z.number().optional().describe("Stop at this sequence number"),
+        skipMoves: z.boolean().default(true).describe("Skip mouse movement events"),
+      }),
+    },
+    async ({ sessionId, speed, fromSequence, toSequence, skipMoves }) => {
+      const webContents = windowManager.getTabManager()?.getActiveWebContents();
+      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
+
+      let events = interactionEventsRepo.findBySession(sessionId, 10000);
+      if (fromSequence != null) events = events.filter(e => e.sequence >= fromSequence);
+      if (toSequence != null) events = events.filter(e => e.sequence <= toSequence);
+
+      if (events.length === 0) return text({ error: "No interactions to replay" });
+
+      const result = await replayEngine.replay(webContents, events, { speed, skipMoves });
+      return text(result);
+    },
+  );
+
+  server.registerTool(
+    "execute_browser_action",
+    {
+      description:
+        "Execute a single browser action: click an element, type text, scroll, or navigate. " +
+        "Use CSS selectors from interaction recordings or get_page_elements to target elements.",
+      inputSchema: z.object({
+        action: z.enum(['click', 'type', 'scroll', 'navigate']).describe("Action to perform"),
+        selector: z.string().optional().describe("CSS selector of target element (for click/type)"),
+        text: z.string().optional().describe("Text to type (for 'type' action)"),
+        url: z.string().optional().describe("URL to navigate (for 'navigate' action)"),
+        x: z.number().optional().describe("X coordinate (for click without selector)"),
+        y: z.number().optional().describe("Y coordinate (for click without selector)"),
+        scrollDelta: z.number().optional().describe("Scroll delta in pixels (for 'scroll' action, positive=down)"),
+      }),
+    },
+    async ({ action, selector, text: inputText, url, x, y, scrollDelta }) => {
+      const webContents = windowManager.getTabManager()?.getActiveWebContents();
+      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
+      const result = await replayEngine.executeAction(webContents, {
+        type: action, selector, text: inputText, url, x, y, scrollDelta,
+      });
+      return text(result);
+    },
+  );
+
+  server.registerTool(
+    "get_page_elements",
+    {
+      description:
+        "Get interactive elements on the current page with their CSS selectors, text content, and bounding boxes. " +
+        "Use this to discover what elements are available before executing browser actions.",
+      inputSchema: z.object({
+        filter: z.enum(['all', 'clickable', 'inputs', 'links', 'buttons']).default('clickable')
+          .describe("Element filter: 'clickable' for buttons/links/interactive, 'inputs' for form fields"),
+      }),
+    },
+    async ({ filter }) => {
+      const webContents = windowManager.getTabManager()?.getActiveWebContents();
+      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
+
+      const selectorMap: Record<string, string> = {
+        all: 'a, button, input, select, textarea, [role="button"], [onclick], [tabindex]',
+        clickable: 'a, button, [role="button"], [onclick], [tabindex]:not(input):not(textarea)',
+        inputs: 'input, select, textarea',
+        links: 'a[href]',
+        buttons: 'button, [role="button"], input[type="submit"], input[type="button"]',
+      };
+
+      const result = await webContents.executeJavaScript(`
+        (function() {
+          const selector = ${JSON.stringify(selectorMap[filter] || selectorMap.clickable)};
+          const elements = Array.from(document.querySelectorAll(selector)).slice(0, 50);
+          return elements.map(el => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) return null; // hidden
+            const id = el.id && !(/[0-9a-f]{8,}|_\\d+$|^:r\\d+:|^ember\\d+/.test(el.id))
+              ? '#' + el.id : null;
+            const testId = el.getAttribute('data-testid');
+            const selector = id || (testId ? '[data-testid=\"' + testId + '\"]' : null)
+              || (el.className && typeof el.className === 'string'
+                ? el.tagName.toLowerCase() + '.' + el.className.trim().split(/\\s+/).slice(0,2).join('.')
+                : el.tagName.toLowerCase());
+            return {
+              selector,
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type'),
+              text: (el.textContent || '').trim().slice(0, 80),
+              placeholder: el.getAttribute('placeholder'),
+              href: el.getAttribute('href'),
+              rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+            };
+          }).filter(Boolean);
+        })()
+      `, true);
+
+      return text(result);
     },
   );
 }

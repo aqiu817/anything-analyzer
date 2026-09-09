@@ -1,4 +1,5 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, crashReporter } from "electron";
+import { initLogger } from "./logger";
 import { getDatabase, closeDatabase } from "./db/database";
 import { runMigrations } from "./db/migrations";
 import {
@@ -10,11 +11,16 @@ import {
   FingerprintProfilesRepo,
   ChatMessagesRepo,
   AiRequestLogRepo,
+  InteractionEventsRepo,
 } from "./db/repositories";
 import { CaptureEngine } from "./capture/capture-engine";
 import { SessionManager } from "./session/session-manager";
 import { AiAnalyzer } from "./ai/ai-analyzer";
 import { WindowManager } from "./window";
+import {
+  ensureTokenCalibrationLoaded,
+  flushTokenCalibration,
+} from "./ai/token-calibration-store";
 import { registerIpcHandlers, loadProxyConfig, applyProxy, loadMCPServerConfig } from "./ipc";
 import { Updater } from "./updater";
 import { MCPClientManager } from "./mcp/mcp-manager";
@@ -31,11 +37,24 @@ const mcpManager = new MCPClientManager();
 let sessionManagerRef: SessionManager | null = null;
 let quitInProgress = false;
 
+// Prevent unhandled promise rejections from crashing the main process.
+// Common source: executeJavaScript on crashed/destroyed WebContents.
+process.on("unhandledRejection", (reason) => {
+  console.warn("[Main] Unhandled rejection:", reason);
+});
+
 // MITM Proxy — initialized lazily inside whenReady (app.getPath requires ready state)
 let caManager: CaManager;
 let mitmProxy: MitmProxyServer;
 
 app.whenReady().then(async () => {
+  ensureTokenCalibrationLoaded();
+  // Initialize structured logging (replaces console.log/warn/error globally)
+  initLogger();
+
+  // Enable native crash reporter — dumps go to userData/Crashpad/
+  crashReporter.start({ uploadToServer: false });
+
   // Initialize MITM CA & proxy (requires app.getPath)
   caManager = new CaManager(join(app.getPath("userData"), "mitm-ca"));
   mitmProxy = new MitmProxyServer(caManager);
@@ -52,6 +71,7 @@ app.whenReady().then(async () => {
   const chatMessagesRepo = new ChatMessagesRepo(db);
   const fingerprintRepo = new FingerprintProfilesRepo(db);
   const aiRequestLogRepo = new AiRequestLogRepo(db);
+  const interactionEventsRepo = new InteractionEventsRepo(db);
   const profileStore = new ProfileStore(fingerprintRepo);
 
   // Initialize capture engine
@@ -62,7 +82,7 @@ app.whenReady().then(async () => {
   );
 
   // Initialize session manager
-  const sessionManager = new SessionManager(sessionsRepo, captureEngine, profileStore);
+  const sessionManager = new SessionManager(sessionsRepo, captureEngine, profileStore, interactionEventsRepo);
   sessionManagerRef = sessionManager;
 
   // Recover from potential crash
@@ -76,6 +96,7 @@ app.whenReady().then(async () => {
     storageSnapshotsRepo,
     reportsRepo,
     aiRequestLogRepo,
+    interactionEventsRepo,
   );
 
   // Create main window
@@ -91,6 +112,21 @@ app.whenReady().then(async () => {
       console.error("Failed to apply proxy config:", err),
     );
   }
+
+  // Handle proxy authentication challenges globally.
+  // Chromium proxyRules cannot carry credentials, so we respond to 407 via this event.
+  app.on("login", (event, _webContents, _request, authInfo, callback) => {
+    if (authInfo.isProxy) {
+      const cfg = loadProxyConfig();
+      if (cfg && cfg.username && cfg.password) {
+        event.preventDefault();
+        callback(cfg.username, cfg.password);
+        return;
+      }
+    }
+    // Non-proxy auth or no credentials — let default behavior proceed
+    callback();
+  });
 
   // Initialize auto-updater
   const updater = new Updater();
@@ -117,6 +153,7 @@ app.whenReady().then(async () => {
     chatMessagesRepo,
     profileStore,
     aiRequestLogRepo,
+    interactionEventsRepo,
   });
 
   // Check for updates on startup (non-blocking, delayed 3s)
@@ -126,10 +163,11 @@ app.whenReady().then(async () => {
   const mcpServerConfig = loadMCPServerConfig();
   if (mcpServerConfig.enabled) {
     initMCPServer(
-      { sessionManager, aiAnalyzer, windowManager, requestsRepo, jsHooksRepo, storageSnapshotsRepo, reportsRepo },
+      { sessionManager, aiAnalyzer, windowManager, requestsRepo, jsHooksRepo, storageSnapshotsRepo, reportsRepo, interactionEventsRepo },
       mcpServerConfig.port,
       mcpServerConfig.authEnabled,
       mcpServerConfig.authToken,
+      mcpServerConfig.host,
     ).catch((err) => console.error("Failed to start MCP Server:", err));
   }
 
@@ -161,6 +199,18 @@ app.whenReady().then(async () => {
       .catch((err) => console.error("[Main] Failed to auto-start MITM proxy:", err));
   }
 
+  // Trust certificates issued by our MITM CA inside Electron.
+  // Without this, HTTPS requests through the MITM proxy fail with SSL errors
+  // that can crash Chromium's network stack (0xC0000005).
+  app.on("certificate-error", (event, _webContents, _url, _error, certificate, callback) => {
+    if (mitmProxy.isRunning() && certificate.issuerName === "Anything Analyzer CA") {
+      event.preventDefault();
+      callback(true);
+    } else {
+      callback(false);
+    }
+  });
+
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       windowManager.createMainWindow();
@@ -183,6 +233,7 @@ app.on("before-quit", (event) => {
   // Block immediate quit and perform ordered async cleanup first.
   event.preventDefault();
   quitInProgress = true;
+  flushTokenCalibration();
 
   (async () => {
     try {

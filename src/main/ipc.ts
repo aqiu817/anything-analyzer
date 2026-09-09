@@ -1,4 +1,5 @@
-import { ipcMain, dialog, app, session } from "electron";
+import { ipcMain, dialog, app, session, shell } from "electron";
+import { networkInterfaces } from "os";
 import type { LLMProviderConfig, MCPServerConfig, MCPServerSettings, MitmProxyConfig, ProxyConfig, PromptTemplate } from "@shared/types";
 import type { SessionManager } from "./session/session-manager";
 import type { AiAnalyzer } from "./ai/ai-analyzer";
@@ -31,10 +32,16 @@ import type {
   SessionsRepo,
   ChatMessagesRepo,
   AiRequestLogRepo,
+  InteractionEventsRepo,
 } from "./db/repositories";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { randomUUID } from "node:crypto";
+import {
+  DEFAULT_MCP_LISTEN_HOST,
+  normalizeMCPListenHost,
+} from "./mcp/mcp-server-listen";
+import { applyModelOverride, fetchLLMModels } from "./ai/model-catalog";
 
 /**
  * Register all IPC handlers for communication between renderer and main process.
@@ -62,6 +69,7 @@ export function registerIpcHandlers(deps: {
   chatMessagesRepo: ChatMessagesRepo;
   profileStore: ProfileStore;
   aiRequestLogRepo: AiRequestLogRepo;
+  interactionEventsRepo: InteractionEventsRepo;
 }): void {
   const {
     sessionManager,
@@ -79,6 +87,7 @@ export function registerIpcHandlers(deps: {
     chatMessagesRepo,
     profileStore,
     aiRequestLogRepo,
+    interactionEventsRepo,
   } = deps;
 
   // ---- Session Management ----
@@ -175,7 +184,8 @@ export function registerIpcHandlers(deps: {
     const elSession = sessionManager.getActiveElectronSession() ?? session.defaultSession;
     await elSession.clearStorageData();
     await elSession.clearCache();
-    windowManager.getTabManager()?.getActiveWebContents()?.reload();
+    const wc = windowManager.getTabManager()?.getActiveWebContents();
+    if (wc && !wc.isDestroyed()) wc.reload();
   });
 
   ipcMain.handle("browser:setRatio", async (_event, ratio: number) => {
@@ -189,6 +199,16 @@ export function registerIpcHandlers(deps: {
 
   ipcMain.handle("browser:setVisible", async (_event, visible: boolean) => {
     windowManager.setTargetViewVisible(visible);
+  });
+
+  ipcMain.handle("browser:toggleDevTools", async () => {
+    const wc = windowManager.getTabManager()?.getActiveWebContents();
+    if (!wc || wc.isDestroyed()) return;
+    if (wc.isDevToolsOpened()) {
+      wc.closeDevTools();
+    } else {
+      wc.openDevTools({ mode: 'detach' });
+    }
   });
 
   // ---- Tab Management ----
@@ -221,6 +241,7 @@ export function registerIpcHandlers(deps: {
       url: t.url,
       title: t.title,
       isActive: t.id === activeTab?.id,
+      isLoading: t.isLoading,
     }));
   });
 
@@ -231,6 +252,7 @@ export function registerIpcHandlers(deps: {
     tabManager.on(
       "tab-created",
       (tabInfo: { id: string; url: string; title: string }) => {
+        if (mainWin.isDestroyed()) return;
         mainWin.webContents.send("tabs:created", {
           id: tabInfo.id,
           url: tabInfo.url,
@@ -240,17 +262,20 @@ export function registerIpcHandlers(deps: {
       },
     );
     tabManager.on("tab-closed", (data: { tabId: string }) => {
+      if (mainWin.isDestroyed()) return;
       mainWin.webContents.send("tabs:closed", data);
     });
     tabManager.on(
       "tab-activated",
       (data: { tabId: string; url: string; title: string }) => {
+        if (mainWin.isDestroyed()) return;
         mainWin.webContents.send("tabs:activated", data);
       },
     );
     tabManager.on(
       "tab-updated",
-      (data: { tabId: string; url?: string; title?: string }) => {
+      (data: { tabId: string; url?: string; title?: string; isLoading?: boolean }) => {
+        if (mainWin.isDestroyed()) return;
         mainWin.webContents.send("tabs:updated", data);
       },
     );
@@ -299,9 +324,10 @@ export function registerIpcHandlers(deps: {
 
   // ---- AI Analysis ----
 
-  ipcMain.handle("ai:analyze", async (_event, sessionId: string, purpose?: string, selectedSeqs?: number[]) => {
-    const config = loadLLMConfig();
-    if (!config) throw new Error("LLM provider not configured");
+  ipcMain.handle("ai:analyze", async (_event, sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => {
+    const savedConfig = loadLLMConfig();
+    if (!savedConfig) throw new Error("LLM provider not configured");
+    const config = applyModelOverride(savedConfig, model);
 
     const win = windowManager.getMainWindow();
     const onProgress = win
@@ -345,8 +371,13 @@ export function registerIpcHandlers(deps: {
       history: Array<{ role: string; content: string }>,
       userMessage: string,
     ) => {
-      const config = loadLLMConfig();
-      if (!config) throw new Error("LLM provider not configured");
+      const savedConfig = loadLLMConfig();
+      if (!savedConfig) throw new Error("LLM provider not configured");
+      const report = reportId ? reportsRepo.findById(reportId) : undefined;
+      const config = applyModelOverride(
+        savedConfig,
+        report?.session_id === sessionId ? report.llm_model : undefined,
+      );
 
       const win = windowManager.getMainWindow();
       const onProgress = win
@@ -406,6 +437,15 @@ export function registerIpcHandlers(deps: {
     "settings:saveLLM",
     async (_event, config: LLMProviderConfig) => {
       saveLLMConfig(config);
+    },
+  );
+
+  ipcMain.handle(
+    "settings:listModels",
+    async (_event, config?: LLMProviderConfig) => {
+      const targetConfig = config ?? loadLLMConfig();
+      if (!targetConfig) throw new Error("LLM provider not configured");
+      return fetchLLMModels(targetConfig);
     },
   );
 
@@ -539,13 +579,30 @@ export function registerIpcHandlers(deps: {
   });
 
   ipcMain.handle("mcp-server:saveConfig", async (_event, config: MCPServerSettings) => {
-    saveMCPServerConfig(config);
+    const normalizedConfig: MCPServerSettings = {
+      ...config,
+      host: normalizeMCPListenHost(config.host),
+    };
+    saveMCPServerConfig(normalizedConfig);
+
+    const { initMCPServer, stopMCPServer, isMCPServerRunning } = await import("./mcp/mcp-server");
+    if (normalizedConfig.enabled) {
+      await initMCPServer(
+        { sessionManager, aiAnalyzer, windowManager, requestsRepo, jsHooksRepo, storageSnapshotsRepo, reportsRepo, interactionEventsRepo },
+        normalizedConfig.port,
+        normalizedConfig.authEnabled,
+        normalizedConfig.authToken,
+        normalizedConfig.host,
+      );
+    } else if (isMCPServerRunning()) {
+      await stopMCPServer();
+    }
   });
 
   ipcMain.handle("mcp-server:status", async () => {
     const { isMCPServerRunning } = await import("./mcp/mcp-server");
     const config = loadMCPServerConfig();
-    return { running: isMCPServerRunning(), port: config.port };
+    return { running: isMCPServerRunning(), host: config.host, port: config.port };
   });
 
   // ---- MITM Proxy ----
@@ -571,6 +628,16 @@ export function registerIpcHandlers(deps: {
 
   ipcMain.handle("mitm-proxy:status", async () => {
     const config = loadMitmProxyConfig();
+    // Collect local IPv4 addresses for LAN device configuration
+    const localIPs: string[] = [];
+    const nets = networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name] || []) {
+        if (net.family === "IPv4" && !net.internal) {
+          localIPs.push(net.address);
+        }
+      }
+    }
     return {
       running: deps.mitmProxy.isRunning(),
       port: deps.mitmProxy.getPort(),
@@ -578,6 +645,7 @@ export function registerIpcHandlers(deps: {
       caInstalled: config.caInstalled,
       caCertPath: deps.caManager.isInitialized() ? deps.caManager.getCaCertPath() : null,
       systemProxyEnabled: config.systemProxy,
+      localIPs,
     };
   });
 
@@ -683,6 +751,45 @@ export function registerIpcHandlers(deps: {
   ipcMain.handle("fingerprint:disable", async () => {
     await sessionManager.disableStealth();
   });
+
+  // ---- Interaction Recording ----
+
+  ipcMain.handle("interaction:getEvents", async (_event, sessionId: string, limit?: number) => {
+    return interactionEventsRepo.findBySession(sessionId, limit ?? 1000);
+  });
+
+  ipcMain.handle("interaction:getCount", async (_event, sessionId: string) => {
+    return interactionEventsRepo.count(sessionId);
+  });
+
+  ipcMain.handle("interaction:clear", async (_event, sessionId: string) => {
+    interactionEventsRepo.deleteBySession(sessionId);
+  });
+
+  // ---- Log Files ----
+
+  ipcMain.handle("log:getPath", () => {
+    return join(app.getPath("userData"), "logs", "main.log");
+  });
+
+  ipcMain.handle("log:openFolder", async () => {
+    const logDir = join(app.getPath("userData"), "logs");
+    shell.openPath(logDir);
+  });
+
+  ipcMain.handle("log:export", async () => {
+    const logPath = join(app.getPath("userData"), "logs", "main.log");
+    if (!existsSync(logPath)) return false;
+    const mainWin = windowManager.getMainWindow();
+    const result = await dialog.showSaveDialog(mainWin!, {
+      defaultPath: `anything-analyzer-logs-${new Date().toISOString().slice(0, 10)}.log`,
+      filters: [{ name: "Log Files", extensions: ["log", "txt"] }],
+    });
+    if (result.canceled || !result.filePath) return false;
+    const { copyFileSync } = await import("fs");
+    copyFileSync(logPath, result.filePath);
+    return true;
+  });
 }
 
 // ---- Config persistence helpers ----
@@ -733,16 +840,23 @@ export async function applyProxy(
     await elSession.setProxy({ mode: "direct" });
     return;
   }
-  const auth = config.username && config.password
-    ? `${config.username}:${config.password}@`
-    : "";
-  const proxyRules = `${config.type}://${auth}${config.host}:${config.port}`;
+
+  // Chromium proxyRules do NOT support inline credentials (user:pass@host)
+  // — that causes ERR_NO_SUPPORTED_PROXIES. Use plain host:port instead.
+  // Proxy auth is handled via app.on('login') in index.ts.
+  const proxyRules = `${config.type}://${config.host}:${config.port}`;
   await elSession.setProxy({ proxyRules });
 }
 
 // ---- MCP Server config persistence ----
 
-const DEFAULT_MCP_SERVER_CONFIG: MCPServerSettings = { enabled: false, port: 23816, authEnabled: true, authToken: '' };
+const DEFAULT_MCP_SERVER_CONFIG: MCPServerSettings = {
+  enabled: false,
+  host: DEFAULT_MCP_LISTEN_HOST,
+  port: 23816,
+  authEnabled: true,
+  authToken: '',
+};
 
 function getMCPServerConfigPath(): string {
   return join(app.getPath("userData"), "mcp-server-config.json");
@@ -759,6 +873,11 @@ export function loadMCPServerConfig(): MCPServerSettings {
     } catch {
       config = { ...DEFAULT_MCP_SERVER_CONFIG };
     }
+  }
+  try {
+    config.host = normalizeMCPListenHost(config.host);
+  } catch {
+    config.host = DEFAULT_MCP_LISTEN_HOST;
   }
   // Auto-generate token if empty (first run or upgraded from old config)
   if (!config.authToken) {

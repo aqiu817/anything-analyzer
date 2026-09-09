@@ -202,6 +202,8 @@ pnpm test       # 运行测试
 pnpm build && npx electron-builder --win  # 构建 Windows 安装包
 ```
 
+> macOS 发布说明：自动更新依赖**已签名且已公证**的安装包。GitHub Actions 发布 mac 版本前，请在仓库 Secrets 中配置 `CSC_LINK`、`CSC_KEY_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID`，否则 `ShipIt` 无法安装更新。
+
 **环境要求：** Node.js >= 18 · pnpm · Visual Studio Build Tools (Windows)
 
 ## Tech Stack
@@ -251,10 +253,28 @@ src/
 
 Thanks to everyone on [LinuxDo](https://linux.do/) for their support!
 
+---
+
+## 赞助鸣谢（下面的服务都是大家日常需要的哦！）
+
+| | |
+|:---:|---|
+| <a href="https://www.rapidproxy.io/?ref=analyzer"><img width="800" height="400" alt="logo" src="https://github.com/user-attachments/assets/809d2d6a-eca6-47fb-ae5b-77bbbbf06884" /></a>|**RapidProxy** 是专为自动化任务和多账号业务打造的高性能代理服务商，提供纯净住宅代理和原生静态 ISP IP。支持 9000 万+ 全球住宅 IP、智能轮换、稳定 Session 和高并发请求，适用于网页数据采集、浏览器自动化、社媒账号运营、电商业务和批量注册等场景。住宅代理低至 $0.55/GB，流量长期有效不过期。使用优惠码 RAPID10 可享 9 折优惠，<a href="https://www.rapidproxy.io/?ref=analyzer">立即免费测试</a>。|
+| <a href="https://www.ipwo.net/?ref=githubMouseww"><img width="457"  alt="b19949dd9bd5760f8b90239ee644be10" src="https://github.com/user-attachments/assets/55f73666-4861-4726-8200-be6ad518c6ef" /></a>|AI 分析工具在处理全球化数据时，可能需要不同地区的访问环境。<br/>IPWO全球住宅代理，提供动静态IP资源，支持http/https/socks5多种协议，可以免费测试，帮助开发者探索更多数据获取与分析应用场景。<br/>优惠折扣码“0202”</br><a href="https://www.ipwo.net/?ref=githubMouseww">点击访问</a>|
+| <img width="457" height="365" alt="image" title="心里咨询服务" src="https://github.com/user-attachments/assets/d31260dc-232d-44b7-a814-29cb201068cf" />|**遇到难题，不必一个人扛** <br/>提供一对一心理支持与家庭关系咨询，擅长：<br/>• 情绪困扰与压力疏导<br/> • 家庭/亲密关系矛盾分析与调解<br/> • 生活重大决策的理性梳理与方案制定<br/> 倾听、梳理、出方案——陪你找到下一步的方向<br/> 电话/微信: 19117443889|
+| <a href="https://bloome.im/app?ref=Mouseww&utm_medium=github&utm_source=Mouseww-anything-analyzer-ivor-202607"><img src="resources/bloome-home.png" width="260" alt="Bloome"></a> | 想用人工智能分析数据？Bloome 让多个 AI 代理（Claude、ChatGPT、DeepSeek 等）在一次对话中协作——无需设置，在云端运行，可在网页和移动设备上使用，而且您可以与整个团队共享已配置的代理。<br>👉 试试 Bloome：**[Bloome_im](https://bloome.im/app?ref=Mouseww&utm_medium=github&utm_source=Mouseww-anything-analyzer-ivor-202607)** |
+| <a href="https://doloffer.com/friend/Pa34D0CG"><img src="resources/doloffer-logo.png" width="180" alt="Doloffer"></a> | **[Doloffer](https://doloffer.com/friend/Pa34D0CG)** — GPT / Claude 真**正版*会员订阅，比官网便宜很多的优惠价，我自己也在用，裂墙推荐。<br>📖 [使用指南](https://github.com/Doloffer-g/guide) \| 🎁 优惠码：`Al8888`（享 9 折） |
+
+
+---
+
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Mouseww/anything-analyzer&type=Date)](https://star-history.com/#Mouseww/anything-analyzer&Date)
+[![Star History Chart](https://api.star-history.com/chart?repos=Mouseww/anything-analyzer&type=date&legend=top-left&sealed_token=ubAtBZiX6zZVGPkbUHr-W8YvpMU3aXgJoWOBiqBNsEUPIL_cElazeGyD6h20cwsWeWbP0cncUSWzrh4bxTTpTf5pAQlvyMGxIA9M0z3UyPeZeo8YR0wo7KJjg7vDukdW77TK0Bat3t-rZ9_oFwA1p-EZGydvVSMmLxMFDo6LsFfVUM4tav6Oh7Ujgqhn)](https://www.star-history.com/?repos=Mouseww%2Fanything-analyzer&type=date&legend=top-left)
 
 ## License
 
 MIT
+
+企鹅交流群：
+1091466461

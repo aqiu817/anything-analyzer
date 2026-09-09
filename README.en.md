@@ -197,6 +197,8 @@ pnpm test       # run tests
 pnpm build && npx electron-builder --win  # build Windows installer
 ```
 
+> macOS release note: auto-update requires **signed and notarized** installers. Before publishing mac builds from GitHub Actions, configure `CSC_LINK`, `CSC_KEY_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, and `APPLE_TEAM_ID` in repository secrets, otherwise `ShipIt` cannot install updates.
+
 **Requirements:** Node.js >= 18, pnpm, Visual Studio Build Tools (Windows)
 
 ## Tech Stack
@@ -245,6 +247,15 @@ This project **does not** include the following capabilities:
 ---
 
 Thanks to everyone on [LinuxDo](https://linux.do/) for their support!
+
+---
+
+## Recommended Resources
+| | |
+|:---:|---|
+| <a href="https://bloome.im/app? ref=Mouseww&utm_medium=github&utm_source=Mouseww-anything-analyzer-ivor-202607"><img src="resources/bloome-home.png" width="260" alt="Bloome"></a> | Want to use AI to analyze data? Bloome enables multiple AI agents (Claude, ChatGPT, DeepSeek, etc.) to collaborate in a single conversation - no setup required, runs in the cloud, can be used on web and mobile devices, and you can share the configured agents with the entire team.<br>👉 Try Bloome: **[Bloome_im](https://bloome.im/app?ref=Mouseww&utm_medium=github&utm_source=Mouseww-anything-analyzer-ivor-202607)** |
+| <a href="https://doloffer.com/friend/Pa34D0CG"><img src="resources/doloffer-logo.png" width="180" alt="Doloffer"></a> | **[Doloffer](https://doloffer.com/friend/Pa34D0CG)** - Official GPT / Claude **Premium** subscription. Offers a significantly cheaper price compared to the official website. I'm using it myself and highly recommend it. [User Guide](https://github.com/Doloffer-g/guide) \| 🎁 Discount code: `Al8888` (90% off) |
+| <a href="https://www.swiftproxy.net/?code=BYQBRGQD3"><img width="1024" height="300" alt="3b3d9abc849f8249e00730b5c6e1ffd0" src="https://github.com/user-attachments/assets/d59e0196-0091-4a45-862e-f5b21775fdb0"></a> | **[Swiftproxy](https://www.swiftproxy.net/?code=BYQBRGQD3)** - High-quality residential proxy service, covering 190+ countries worldwide, with over 80 million dynamic residential IPs. Supports high anonymity, stable connections, no expiration of traffic, and offers free testing. Suitable for data collection, AI automation, browser simulation, and various data analysis scenarios. \| 🎁 Discount code: `PROXY90` (90% off) |
 
 ## Star History
 

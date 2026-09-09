@@ -97,7 +97,7 @@ export interface AiRequestLog {
   id: number;
   session_id: string | null;
   report_id: string | null;
-  type: 'analyze' | 'chat' | 'filter';
+  type: AiRequestLogType;
   provider: string;
   model: string;
   request_url: string;
@@ -114,6 +114,8 @@ export interface AiRequestLog {
   created_at: number;
 }
 
+export type AiRequestLogType = 'analyze' | 'chat' | 'filter' | 'compress' | 'subagent';
+
 /** Data passed from LLMRouter intercept (without context fields filled by caller) */
 export interface AiRequestLogData {
   request_url: string;
@@ -127,15 +129,47 @@ export interface AiRequestLogData {
   error: string | null;
 }
 
-// ---- Request Summary (Phase 1 预过滤) ----
+export interface ContextBudgetConfig {
+  /** 模型最大上下文，单位 token；默认 200000 */
+  maxContextTokens: number;
+  /** 触发压缩的占用峰值；默认 0.85 */
+  compressionPeak: number;
+  /** 压缩后目标占用；默认 0.55 */
+  compressionTarget: number;
+  /** 预留给 completion 的 token；默认 8192 */
+  reserveCompletionTokens: number;
+  /** 上下文组装模式；默认 index_first */
+  contextMode: ContextMode;
+  /** 压缩方式；默认 rules */
+  compressionMode: CompressionMode;
+  /** 超大请求集是否启用并行子分析；默认 true */
+  subagentEnabled: boolean;
+  /** 达到该请求数后启用子分析；默认 400 */
+  subagentThreshold: number;
+  /** 每个子任务处理的请求摘要数；默认 120 */
+  subagentChunkSize: number;
+  /** 最大并行子任务数；默认 3 */
+  maxSubagents: number;
+}
 
-/** Phase 1 轻量请求摘要，用于 AI 相关性过滤 */
+export type CompressionMode = "rules" | "hybrid";
+export type ContextMode = "index_first" | "legacy_inline";
+
+// ---- Request Summary (Phase 1 预过滤 / index-first) ----
+
+/** 轻量请求摘要：用于 AI 相关性过滤与 index-first 首轮上下文 */
 export interface RequestSummary {
   seq: number;
   method: string;
   url: string;
   status: number | null;
   contentType: string | null;
+  timestamp?: number;
+  bodyBytes?: number;
+  responseBytes?: number;
+  hasAuthHeader?: boolean;
+  isStreaming?: boolean;
+  hookCount?: number;
 }
 
 // ---- Scene Hint ----
@@ -163,6 +197,16 @@ export interface ChatMessage {
   content: string;
 }
 
+/**
+ * 从 assistant 消息内容中移除 <tool_context> 块（用于前端显示）。
+ * LLM 对话历史中保留该块以维持工具交互上下文。
+ */
+export function stripToolContext(content: string): string {
+  return content
+    .replace(/\n*<tool_context>[\s\S]*?<\/tool_context>\s*$/g, '')
+    .replace(/\n*<tool_state>[\s\S]*?<\/tool_state>\s*$/g, '');
+}
+
 // ---- Browser Tab ----
 
 export interface BrowserTab {
@@ -170,6 +214,7 @@ export interface BrowserTab {
   url: string;
   title: string;
   isActive: boolean;
+  isLoading?: boolean;
 }
 
 // ---- Auto Update ----
@@ -214,6 +259,8 @@ export interface LLMProviderConfig {
   apiKey: string;
   model: string;
   maxTokens: number;
+  /** 可选：分析/追问上下文预算与压缩策略 */
+  contextBudget?: Partial<ContextBudgetConfig>;
 }
 
 // ---- Prompt Template ----
@@ -263,6 +310,7 @@ export interface ProxyConfig {
 
 export interface MCPServerSettings {
   enabled: boolean;
+  host: string;
   port: number;
   authEnabled: boolean;
   authToken: string;
@@ -284,6 +332,68 @@ export interface MitmProxyStatus {
   caInstalled: boolean;
   caCertPath: string | null;
   systemProxyEnabled: boolean;
+}
+
+// ---- Interaction Recording ----
+
+export type InteractionType = 'click' | 'dblclick' | 'input' | 'scroll' | 'navigate' | 'hover';
+
+export interface InteractionEvent {
+  id: number;
+  session_id: string;
+  sequence: number;
+  type: InteractionType;
+  timestamp: number;
+  // Position
+  x: number | null;
+  y: number | null;
+  viewport_x: number | null;
+  viewport_y: number | null;
+  // Element
+  selector: string | null;
+  xpath: string | null;
+  tag_name: string | null;
+  element_text: string | null;
+  attributes: string | null;    // JSON
+  bounding_rect: string | null; // JSON
+  // Input
+  input_value: string | null;
+  key: string | null;
+  // Scroll
+  scroll_x: number | null;
+  scroll_y: number | null;
+  scroll_dx: number | null;
+  scroll_dy: number | null;
+  // Context
+  url: string;
+  page_title: string | null;
+  path: string | null;          // JSON: mouse move path [{x, y, t}...]
+  created_at: number;
+}
+
+/** Raw interaction data sent from page injection script to main process */
+export interface RawInteractionData {
+  type: InteractionType;
+  timestamp: number;
+  x?: number;
+  y?: number;
+  viewportX?: number;
+  viewportY?: number;
+  selector?: string;
+  xpath?: string;
+  tagName?: string;
+  elementText?: string;
+  attributes?: Record<string, string>;
+  boundingRect?: { x: number; y: number; width: number; height: number };
+  inputValue?: string;
+  key?: string;
+  scrollX?: number;
+  scrollY?: number;
+  scrollDX?: number;
+  scrollDY?: number;
+  url: string;
+  pageTitle?: string;
+  path?: Array<{ x: number; y: number; t: number }>;
 }
 
 // ---- Fingerprint Profile ----
@@ -329,6 +439,8 @@ export interface FilteredRequest {
   responseHeaders: Record<string, string> | null;
   responseBody: string | null;
   hooks: JsHookRecord[];
+  /** 请求时间戳（ms），用于 index-first 列表展示 */
+  timestamp?: number;
 }
 
 // ---- Crypto Script Snippet ----
@@ -417,6 +529,7 @@ export const IPC_CHANNELS = {
   // Settings
   SETTINGS_GET_LLM: "settings:getLLM",
   SETTINGS_SAVE_LLM: "settings:saveLLM",
+  SETTINGS_LIST_MODELS: "settings:listModels",
 
   // Tabs
   TABS_CREATE: "tabs:create",
@@ -503,6 +616,7 @@ export interface ElectronAPI {
   reload: () => Promise<void>;
   setBrowserRatio: (ratio: number) => Promise<void>;
   setTargetViewVisible: (visible: boolean) => Promise<void>;
+  toggleDevTools: () => Promise<void>;
   exportFile: (defaultName: string, content: string) => Promise<boolean>;
   openExternal: (url: string) => Promise<void>;
 
@@ -512,7 +626,7 @@ export interface ElectronAPI {
   getReports: (sessionId: string) => Promise<AnalysisReport[]>;
   clearCaptureData: (sessionId: string) => Promise<void>;
 
-  startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[]) => Promise<AnalysisReport>;
+  startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => Promise<AnalysisReport>;
   cancelAnalysis: (sessionId: string) => Promise<void>;
   sendFollowUp: (sessionId: string, reportId: string, history: ChatMessage[], userMessage: string) => Promise<string>;
   getChatMessages: (reportId: string) => Promise<ChatMessage[]>;
@@ -526,6 +640,7 @@ export interface ElectronAPI {
 
   getLLMConfig: () => Promise<LLMProviderConfig | null>;
   saveLLMConfig: (config: LLMProviderConfig) => Promise<void>;
+  listLLMModels: (config?: LLMProviderConfig) => Promise<string[]>;
 
   // Tab management
   createTab: (url?: string) => Promise<BrowserTab>;
@@ -540,7 +655,7 @@ export interface ElectronAPI {
     callback: (data: { tabId: string; url: string; title: string }) => void,
   ) => void;
   onTabUpdated: (
-    callback: (data: { tabId: string; url?: string; title?: string }) => void,
+    callback: (data: { tabId: string; url?: string; title?: string; isLoading?: boolean }) => void,
   ) => void;
 
   onRequestCaptured: (callback: (data: CapturedRequest) => void) => void;
@@ -584,7 +699,7 @@ export interface ElectronAPI {
   // MCP Server
   getMCPServerConfig: () => Promise<MCPServerSettings>;
   saveMCPServerConfig: (config: MCPServerSettings) => Promise<void>;
-  getMCPServerStatus: () => Promise<{ running: boolean; port: number | null }>;
+  getMCPServerStatus: () => Promise<{ running: boolean; host: string; port: number | null }>;
 
   // MITM Proxy
   getMitmProxyConfig: () => Promise<MitmProxyConfig>;
@@ -603,6 +718,17 @@ export interface ElectronAPI {
   regenerateFingerprintProfile: (sessionId: string) => Promise<FingerprintProfile>;
   enableFingerprint: (sessionId: string) => Promise<void>;
   disableFingerprint: () => Promise<void>;
+
+  // Interaction Recording
+  getInteractions: (sessionId: string, limit?: number) => Promise<InteractionEvent[]>;
+  getInteractionCount: (sessionId: string) => Promise<number>;
+  clearInteractions: (sessionId: string) => Promise<void>;
+  onInteractionRecorded: (callback: (data: { type: string; sequence: number; timestamp: number }) => void) => void;
+
+  // Log files
+  getLogPath: () => Promise<string>;
+  openLogFolder: () => Promise<void>;
+  exportLogs: () => Promise<boolean>;
 }
 
 declare global {

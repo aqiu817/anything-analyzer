@@ -6,7 +6,15 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { AnalysisReport, ChatMessage, CapturedRequest, JsHookRecord } from '@shared/types'
+import { stripToolContext } from '@shared/types'
 import { AiLogView } from './AiLogView'
+import ContextUsageBar from './ContextUsageBar'
+import {
+  buildContextUsageSnapshot,
+  resolveContextUsedTokens,
+  type ConversationTokenUsage,
+  type ContextUsageSnapshot,
+} from '@shared/token-estimate'
 import styles from './ReportView.module.css'
 
 interface ReportViewProps {
@@ -14,7 +22,7 @@ interface ReportViewProps {
   isAnalyzing: boolean
   analysisError: string | null
   streamingContent: string
-  onReAnalyze: (purpose?: string) => void
+  onReAnalyze: (model?: string) => void
   onCancelAnalysis: () => void
   chatHistory: ChatMessage[]
   isChatting: boolean
@@ -24,6 +32,14 @@ interface ReportViewProps {
   sessionName?: string
   requests?: CapturedRequest[]
   hooks?: JsHookRecord[]
+  /** 外部传入的上下文占用快照；缺省时组件内估算 */
+  contextUsage?: ContextUsageSnapshot | null
+  contextSource?: ConversationTokenUsage | null
+  availableModels?: string[]
+  selectedModel?: string
+  isLoadingModels?: boolean
+  onModelChange?: (model: string) => void
+  onRefreshModels?: () => void
 }
 
 function formatTokens(tokens: number | null): string {
@@ -122,18 +138,69 @@ const ReportView: React.FC<ReportViewProps> = ({
   sessionName,
   requests = [],
   hooks = [],
+  contextUsage: contextUsageProp = null,
+  contextSource = null,
+  availableModels = [],
+  selectedModel = '',
+  isLoadingModels = false,
+  onModelChange,
+  onRefreshModels,
 }) => {
   const { t } = useLocale()
   const [chatInput, setChatInput] = useState('')
   const [showAiLog, setShowAiLog] = useState(false)
   const reportBodyRef = useRef<HTMLDivElement>(null)
+  const [budgetCfg, setBudgetCfg] = useState({
+    maxContextTokens: 200_000,
+    reserveCompletionTokens: 8_192,
+    compressionPeak: 0.85,
+  })
 
-  // Auto-scroll report body when streaming
   useEffect(() => {
-    if (streamingContent && reportBodyRef.current) {
+    let alive = true
+    window.electronAPI.getLLMConfig?.().then((config) => {
+      if (!alive || !config?.contextBudget) return
+      const b = config.contextBudget
+      setBudgetCfg({
+        maxContextTokens: b.maxContextTokens ?? 200_000,
+        reserveCompletionTokens: b.reserveCompletionTokens ?? 8_192,
+        compressionPeak: b.compressionPeak ?? 0.85,
+      })
+    }).catch(() => { /* ignore */ })
+    return () => { alive = false }
+  }, [])
+
+  const localUsage = React.useMemo(() => {
+    const messages = chatHistory.map((m) => ({ content: stripToolContext(m.content) }))
+    // 无历史时用报告正文估一个底数
+    if (messages.length === 0 && report?.report_content) {
+      messages.push({ content: report.report_content })
+    }
+    const used = resolveContextUsedTokens({
+      fallbackMessages: messages,
+    })
+    return buildContextUsageSnapshot(used, budgetCfg)
+  }, [chatHistory, report?.prompt_tokens, report?.report_content, budgetCfg])
+
+  const usage = contextUsageProp ?? localUsage
+
+
+  // Auto-scroll report body when streaming or new chat messages arrive
+  useEffect(() => {
+    if ((streamingContent || isChatting) && reportBodyRef.current) {
       reportBodyRef.current.scrollTop = reportBodyRef.current.scrollHeight
     }
-  }, [streamingContent])
+  }, [streamingContent, isChatting])
+
+  useEffect(() => {
+    if (chatHistory.length > 2 && reportBodyRef.current) {
+      requestAnimationFrame(() => {
+        if (reportBodyRef.current) {
+          reportBodyRef.current.scrollTop = reportBodyRef.current.scrollHeight
+        }
+      })
+    }
+  }, [chatHistory.length])
 
   const handleSend = () => {
     const trimmed = chatInput.trim()
@@ -151,7 +218,7 @@ const ReportView: React.FC<ReportViewProps> = ({
       content += '\n\n---\n\n## Follow-up Chat\n'
       for (const msg of followUps) {
         const label = msg.role === 'user' ? '**User**' : '**AI**'
-        content += `\n${label}:\n\n${msg.content}\n`
+        content += `\n${label}:\n\n${stripToolContext(msg.content)}\n`
       }
     }
     await window.electronAPI.exportFile(defaultName, content)
@@ -159,6 +226,11 @@ const ReportView: React.FC<ReportViewProps> = ({
 
   const endpoints = extractEndpoints(requests)
   const hookSummary = summarizeHooks(hooks)
+  const effectiveModel = selectedModel || report?.llm_model || ''
+  const modelOptions = React.useMemo(
+    () => [...new Set([...availableModels, effectiveModel].filter(Boolean))],
+    [availableModels, effectiveModel],
+  )
 
   // Render right context panel
   const renderContextPanel = () => (
@@ -211,17 +283,40 @@ const ReportView: React.FC<ReportViewProps> = ({
       {/* Report metadata if available */}
       {report && (
         <div className={styles.contextSection}>
-          <div className={styles.contextLabel}>LLM</div>
+          <div className={styles.contextLabel}>{t('report.reportUsage')}</div>
           <div className={styles.contextItem}>
             <div className={styles.contextDot} style={{ background: 'var(--color-info)' }} />
             {report.llm_model}
           </div>
           {report.prompt_tokens != null && report.completion_tokens != null && (
-            <div className={styles.contextItem}>
+            <div
+              className={styles.contextItem}
+              title={t('report.tokenBreakdown', {
+                prompt: report.prompt_tokens.toLocaleString(),
+                completion: report.completion_tokens.toLocaleString(),
+              })}
+            >
               <div className={styles.contextDot} style={{ background: 'var(--color-success)' }} />
-              {formatTokens(report.prompt_tokens + report.completion_tokens)} tokens
+              {t('report.cumulativeUsage')} {formatTokens(report.prompt_tokens + report.completion_tokens)} tokens
             </div>
           )}
+          <div className={styles.contextLabel} style={{ marginTop: 14 }}>{t('report.currentContext')}</div>
+          <div className={styles.contextItem}>
+            <div className={styles.contextDot} style={{ background: 'var(--color-warning)' }} />
+            {contextSource?.model ?? contextSource?.provider ?? t('report.localEstimate')}
+            {contextSource && ` · ${t('report.followUpRequest')}`}
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <ContextUsageBar
+              usedTokens={usage.usedTokens}
+              maxContextTokens={usage.maxContextTokens}
+              usableTokens={usage.usableTokens}
+              remainingTokens={usage.remainingTokens}
+              reserveCompletionTokens={usage.reserveCompletionTokens}
+              peakRatio={usage.peakRatio}
+              usageRatio={usage.usageRatio}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -277,7 +372,7 @@ const ReportView: React.FC<ReportViewProps> = ({
               icon={<IconFileText size={48} style={{ opacity: 0.25 }} />}
               description={t('report.noReport')}
             />
-            <Button variant="primary" icon={<IconRobot size={14} />} onClick={() => onReAnalyze()}>
+            <Button variant="primary" icon={<IconRobot size={14} />} onClick={() => onReAnalyze(effectiveModel)}>
               {t('report.startAnalysis')}
             </Button>
           </div>
@@ -304,11 +399,29 @@ const ReportView: React.FC<ReportViewProps> = ({
       <div className={styles.reportMain}>
         {/* Toolbar */}
         <div className={styles.reportToolbar}>
-          <div className={styles.toolLabel}>{t('capture.autoDetect')}</div>
-          <button className={styles.toolBtnPrimary}>✦ {report.llm_model}</button>
+          <div className={styles.toolLabel}>{t('report.analysisModel')}</div>
+          <select
+            className={styles.modelSelect}
+            value={effectiveModel}
+            disabled={isChatting}
+            onChange={(event) => onModelChange?.(event.target.value)}
+            title={t('report.analysisModel')}
+          >
+            {modelOptions.map(model => (
+              <option key={model} value={model}>{model}</option>
+            ))}
+          </select>
+          <button
+            className={styles.toolBtn}
+            onClick={onRefreshModels}
+            disabled={isLoadingModels || isChatting}
+            title={t('report.refreshModels')}
+          >
+            {isLoadingModels ? '…' : '↻'}
+          </button>
           <div className={styles.toolSpacer} />
           <button className={styles.toolBtn} onClick={handleExport}>⬇ {t('report.export')}</button>
-          <button className={styles.toolBtn} onClick={() => onReAnalyze()}>↻ {t('report.reanalyze')}</button>
+          <button className={styles.toolBtn} disabled={isChatting} onClick={() => onReAnalyze(effectiveModel)}>↻ {t('report.reanalyze')}</button>
           <button className={styles.toolBtn} onClick={() => setShowAiLog(true)}>📋 {t('aiLog.title')}</button>
         </div>
 
@@ -329,6 +442,7 @@ const ReportView: React.FC<ReportViewProps> = ({
               </ReactMarkdown>
             </div>
 
+
             {/* Chat history */}
             {chatHistory.slice(2).map((msg, i) => (
               <div key={i} className={`${styles.chatMsg} ${msg.role === 'user' ? styles.chatMsgUser : styles.chatMsgAi}`}>
@@ -337,7 +451,7 @@ const ReportView: React.FC<ReportViewProps> = ({
                 </Tag>
                 <div className="report-markdown-content">
                   <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                    {msg.content}
+                    {stripToolContext(msg.content)}
                   </ReactMarkdown>
                 </div>
               </div>
@@ -369,6 +483,16 @@ const ReportView: React.FC<ReportViewProps> = ({
 
         {/* Chat section */}
         <div className={styles.chatSection}>
+          <ContextUsageBar
+            usedTokens={usage.usedTokens}
+            maxContextTokens={usage.maxContextTokens}
+            usableTokens={usage.usableTokens}
+            remainingTokens={usage.remainingTokens}
+            reserveCompletionTokens={usage.reserveCompletionTokens}
+            peakRatio={usage.peakRatio}
+            usageRatio={usage.usageRatio}
+            compact
+          />
           <div className={styles.chatSuggestions}>
             {QUICK_QUESTION_KEYS.map((key, i) => {
               const text = t(key)

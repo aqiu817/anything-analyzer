@@ -6,7 +6,10 @@ import { join } from "path";
 const CA_KEY_FILE = "ca-key.pem";
 const CA_CERT_FILE = "ca-cert.pem";
 const CA_VALIDITY_YEARS = 10;
-const LEAF_VALIDITY_DAYS = 825; // Apple max
+// Chrome / Chromium / Firefox / iOS / Android 自 2020-09 起统一上限 398 天。
+// 825 是 Apple 历史值，已不被任何现代浏览器接受（Android Chrome 直接报 ERR_CERT_VALIDITY_TOO_LONG）。
+// 留 33 天缓冲避免边界期 cert 被拒。
+const LEAF_VALIDITY_DAYS = 365;
 const CACHE_MAX_SIZE = 500;
 
 /**
@@ -52,6 +55,16 @@ export class CaManager {
 
   getCaCertPath(): string {
     return join(this.certsDir, CA_CERT_FILE);
+  }
+
+  /**
+   * Get the CA certificate in DER (binary) format for mobile download.
+   */
+  getCaCertDer(): Buffer {
+    if (!this.caCert) throw new Error("CA not initialized");
+    const asn1 = forge.pki.certificateToAsn1(this.caCert);
+    const der = forge.asn1.toDer(asn1);
+    return Buffer.from(der.getBytes(), "binary");
   }
 
   /**
@@ -170,13 +183,23 @@ export class CaManager {
       },
       { name: "extKeyUsage", serverAuth: true },
       { name: "subjectAltName", altNames },
+      { name: "subjectKeyIdentifier" },
+      {
+        name: "authorityKeyIdentifier",
+        // AKI 必须等于 CA 的 SKI；node-forge 的 keyIdentifier:true 会错用叶子自己的公钥，
+        // 导致每个域名 AKI 都是"随机值"，Android CertPathValidator 会判定 trust anchor 不匹配。
+        keyIdentifier: this.caCert!.generateSubjectKeyIdentifier().getBytes(),
+      },
     ]);
 
     cert.sign(this.caKey.privateKey, forge.md.sha256.create());
 
+    // Include CA cert in chain so mobile clients can verify
+    const leafPem = forge.pki.certificateToPem(cert);
+    const caPem = forge.pki.certificateToPem(this.caCert!);
     return {
       key: forge.pki.privateKeyToPem(keys.privateKey),
-      cert: forge.pki.certificateToPem(cert),
+      cert: leafPem + caPem,
     };
   }
 

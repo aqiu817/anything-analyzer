@@ -1,5 +1,12 @@
 import type { LLMProviderConfig, AiRequestLogData } from "@shared/types";
 import type { MCPToolInfo } from "../mcp/mcp-manager";
+import {
+  compactMessagesToBudget,
+  estimateTokens,
+  getCompressionTargetTokens,
+  getCompressionTriggerTokens,
+  normalizeContextBudget,
+} from "./context-budget";
 
 interface LLMResponse {
   content: string;
@@ -22,6 +29,31 @@ interface ToolCall {
   function: { name: string; arguments: string };
 }
 
+interface ToolBinding {
+  exposedName: string;
+  tool: MCPToolInfo;
+}
+
+function createToolBindings(tools: MCPToolInfo[]): ToolBinding[] {
+  const usedNames = new Set<string>();
+  return tools.map((tool, index) => {
+    const baseName = tool.name.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) || `tool_${index + 1}`;
+    let exposedName = baseName;
+    let suffix = 2;
+    while (usedNames.has(exposedName)) {
+      const suffixText = `_${suffix}`;
+      exposedName = `${baseName.slice(0, 64 - suffixText.length)}${suffixText}`;
+      suffix += 1;
+    }
+    usedNames.add(exposedName);
+    return { exposedName, tool };
+  });
+}
+
+interface ResponsesIncompleteDetails {
+  reason?: string;
+}
+
 // Anthropic content block types
 interface AnthropicTextBlock {
   type: "text";
@@ -37,7 +69,168 @@ interface AnthropicToolUseBlock {
 
 type AnthropicContentBlock = AnthropicTextBlock | AnthropicToolUseBlock;
 
+interface AnthropicUsage {
+  input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  output_tokens?: number;
+}
+
 const DEFAULT_TIMEOUT = 600000; // 10 minutes — LLM relay servers can be slow; user can cancel manually
+const DEFAULT_MAX_TOOL_ROUNDS = 64;
+const TOOL_RESULT_BUDGET_RATIO = 0.75;
+const TOOL_RESULT_TRUNCATION_MARKER = "\n...[tool result truncated to stay within context budget]";
+const TOOL_RESULT_OMITTED = "[tool result omitted: context budget exhausted; query a narrower range]";
+
+interface ResponsesOutputItem {
+  type: string;
+  content?: Array<{ type: string; text?: unknown }>;
+}
+
+function extractResponsesOutputText(output: ResponsesOutputItem[]): string {
+  let content = "";
+  for (const item of output) {
+    if (item.type === "message" && Array.isArray(item.content)) {
+      content += item.content
+        .filter((c) => c.type === "output_text" && typeof c.text === "string")
+        .map((c) => c.text as string)
+        .join("");
+    }
+  }
+  return content;
+}
+
+function readResponsesOutputText(data: {
+  output_text?: unknown;
+  output?: ResponsesOutputItem[];
+}): string {
+  const content =
+    typeof data.output_text === "string" && data.output_text.length > 0
+      ? data.output_text
+      : Array.isArray(data.output)
+        ? extractResponsesOutputText(data.output)
+        : "";
+
+  if (content.length === 0) {
+    throw new Error(`LLM 响应格式异常: 缺少 output_text 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+  }
+
+  return content;
+}
+
+function requireLLMContent(content: string, fieldName: string): string {
+  if (content.length === 0) {
+    throw new Error(`LLM 响应格式异常: 缺少 ${fieldName} 字段`);
+  }
+  return content;
+}
+
+function truncateTextToTokenBudget(content: string, maxTokens: number): string {
+  if (maxTokens <= 0) return TOOL_RESULT_OMITTED;
+  if (estimateTokens(content) <= maxTokens) return content;
+
+  const markerTokens = estimateTokens(TOOL_RESULT_TRUNCATION_MARKER);
+  if (maxTokens <= markerTokens) return TOOL_RESULT_OMITTED;
+
+  let low = 0;
+  let high = content.length;
+  let best = TOOL_RESULT_OMITTED;
+  while (low <= high) {
+    const keepChars = Math.floor((low + high) / 2);
+    const headChars = Math.ceil(keepChars * 0.7);
+    const tailChars = Math.max(0, keepChars - headChars);
+    const candidate = `${content.slice(0, headChars)}${TOOL_RESULT_TRUNCATION_MARKER}${tailChars > 0 ? content.slice(-tailChars) : ""}`;
+    if (estimateTokens(candidate) <= maxTokens) {
+      best = candidate;
+      low = keepChars + 1;
+    } else {
+      high = keepChars - 1;
+    }
+  }
+  return best;
+}
+
+function createToolResultLimiter(config: LLMProviderConfig): (results: string[]) => string[] {
+  const budget = normalizeContextBudget(config.contextBudget);
+  const toolResultTokens = Math.max(
+    512,
+    Math.floor(
+      (getCompressionTriggerTokens(budget) - getCompressionTargetTokens(budget))
+      * TOOL_RESULT_BUDGET_RATIO,
+    ),
+  );
+  let remainingTokens = toolResultTokens;
+
+  return (results: string[]): string[] => results.map((result, index) => {
+    if (remainingTokens <= 0) return TOOL_RESULT_OMITTED;
+    const remainingResults = results.length - index;
+    const resultBudget = Math.max(1, Math.floor(remainingTokens / remainingResults));
+    const limited = truncateTextToTokenBudget(result, resultBudget);
+    remainingTokens = Math.max(0, remainingTokens - estimateTokens(limited));
+    return limited;
+  });
+}
+
+function normalizeMaxToolRounds(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_MAX_TOOL_ROUNDS;
+  return Math.max(1, Math.floor(value));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readToolArguments(argumentsJson: string, fieldName: string): Record<string, unknown> {
+  try {
+    const args = JSON.parse(argumentsJson);
+    if (isRecord(args)) return args;
+  } catch {
+    // Fall through to the common protocol error below.
+  }
+  throw new Error(`${fieldName} arguments must be a valid JSON object`);
+}
+
+function parseStreamJson<T>(data: string, providerName: string): T {
+  try {
+    return JSON.parse(data) as T;
+  } catch {
+    throw new Error(`${providerName} stream error: malformed JSON payload`);
+  }
+}
+
+function readStreamTextDelta(
+  value: unknown,
+  providerName: string,
+  fieldName: string,
+  required = false,
+): string {
+  if (typeof value === "string") return value;
+  if (!required && value == null) return "";
+  throw new Error(`${providerName} stream error: ${fieldName} must be a string`);
+}
+
+function readAnthropicTextContent(data: {
+  content: Array<{ type: string; text?: unknown }>;
+}): string {
+  const textBlocks = data.content.filter((block) => block.type === "text");
+  if (textBlocks.some((block) => typeof block.text !== "string")) {
+    throw new Error(`LLM 响应格式异常: text content 必须是字符串 — ${JSON.stringify(data).slice(0, 200)}`);
+  }
+
+  const content = textBlocks.map((block) => block.text as string).join("");
+  if (content.length === 0) {
+    throw new Error(`LLM 响应格式异常: 缺少 text content 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+  }
+
+  return content;
+}
+
+function readAnthropicPromptTokens(usage?: AnthropicUsage): number {
+  if (!usage) return 0;
+  return (usage.input_tokens || 0)
+    + (usage.cache_creation_input_tokens || 0)
+    + (usage.cache_read_input_tokens || 0);
+}
 
 /**
  * Sanitize string content in LLM request body to remove control characters
@@ -74,15 +267,51 @@ function maskSensitiveHeaders(headers: Record<string, string>): Record<string, s
   return masked;
 }
 
+function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => signal?.removeEventListener("abort", abort);
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const abort = (): void => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
 /**
  * LLMRouter — Unified interface for calling different LLM providers.
  * Supports OpenAI, Anthropic, and OpenAI-compatible APIs.
  */
 export class LLMRouter {
+  private readonly responseLogIds = new WeakMap<Response, number>();
+
   constructor(
     private config: LLMProviderConfig,
-    private onRequestComplete?: (log: AiRequestLogData) => void,
+    private onRequestComplete?: (log: AiRequestLogData) => number | void,
+    private onRequestUsage?: (logId: number, promptTokens: number, completionTokens: number) => void,
   ) {}
+
+  private attachLogId(response: Response, logId: number | void): Response {
+    if (typeof logId === "number") this.responseLogIds.set(response, logId);
+    return response;
+  }
+
+  private recordResponseUsage(
+    response: Response,
+    promptTokens: number,
+    completionTokens: number,
+  ): void {
+    const logId = this.responseLogIds.get(response);
+    if (logId === undefined) return;
+    this.onRequestUsage?.(logId, promptTokens, completionTokens);
+  }
 
   /**
    * Safely parse JSON from a fetch Response.
@@ -101,10 +330,17 @@ export class LLMRouter {
     }
 
     // Anthropic error format: { type: "error", error: { type, message } }
-    const obj = data as Record<string, unknown>;
+    const obj = data !== null && typeof data === "object"
+      ? data as Record<string, unknown>
+      : {};
     if (obj.type === 'error' && typeof obj.error === 'object' && obj.error !== null) {
       const err = obj.error as Record<string, unknown>;
       throw new Error(`LLM API 错误: ${err.type ?? 'unknown'} — ${err.message ?? JSON.stringify(err)}`);
+    }
+
+    // Responses API failed payloads need endpoint-specific handling.
+    if (obj.status === "failed") {
+      return data as T;
     }
 
     // OpenAI error format: { error: { message, type, code } }
@@ -113,20 +349,21 @@ export class LLMRouter {
       throw new Error(`LLM API 错误: ${err.message ?? JSON.stringify(err)}`);
     }
 
-    return data as T;
+    return obj as T;
   }
 
   async complete(
     messages: ChatMessage[],
     onChunk?: (chunk: string) => void,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     if (this.config.name === "anthropic" || this.config.name === "minimax") {
-      return this.completeAnthropic(messages, onChunk);
+      return this.completeAnthropic(messages, onChunk, signal);
     }
     if (this.config.apiType === "responses") {
-      return this.completeResponses(messages, onChunk);
+      return this.completeResponses(messages, onChunk, signal);
     }
-    return this.completeOpenAI(messages, onChunk);
+    return this.completeOpenAI(messages, onChunk, signal);
   }
 
   /**
@@ -138,16 +375,22 @@ export class LLMRouter {
     tools: MCPToolInfo[],
     callTool: (name: string, args: Record<string, unknown>) => Promise<string>,
     onChunk?: (chunk: string) => void,
-    maxRounds = 10,
+    maxRounds = DEFAULT_MAX_TOOL_ROUNDS,
     signal?: AbortSignal,
   ): Promise<LLMResponse> {
+    const budget = normalizeContextBudget(this.config.contextBudget);
+    const toolLoopMessages = compactMessagesToBudget(messages, {
+      ...budget,
+      compressionPeak: Math.max(0.5, Math.min(budget.compressionPeak, budget.compressionTarget)),
+    }).messages;
+    const normalizedMaxRounds = normalizeMaxToolRounds(maxRounds);
     if (this.config.name === "anthropic" || this.config.name === "minimax") {
-      return this.agenticLoopAnthropic(messages, tools, callTool, onChunk, maxRounds);
+      return this.agenticLoopAnthropic(toolLoopMessages, tools, callTool, onChunk, normalizedMaxRounds, signal);
     }
     if (this.config.apiType === "responses") {
-      return this.agenticLoopResponses(messages, tools, callTool, onChunk, maxRounds);
+      return this.agenticLoopResponses(toolLoopMessages, tools, callTool, onChunk, normalizedMaxRounds, signal);
     }
-    return this.agenticLoopOpenAI(messages, tools, callTool, onChunk, maxRounds);
+    return this.agenticLoopOpenAI(toolLoopMessages, tools, callTool, onChunk, normalizedMaxRounds, signal);
   }
 
   // ---- Agentic Loop: OpenAI / Custom ----
@@ -157,22 +400,31 @@ export class LLMRouter {
     tools: MCPToolInfo[],
     callTool: (name: string, args: Record<string, unknown>) => Promise<string>,
     onChunk?: (chunk: string) => void,
-    maxRounds = 10,
+    maxRounds = DEFAULT_MAX_TOOL_ROUNDS,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
-    const openaiTools = tools.map((t) => ({
+    const bindings = createToolBindings(tools);
+    const bindingByExposedName = new Map(bindings.map((binding) => [binding.exposedName, binding]));
+    const callBoundTool = (name: string, args: Record<string, unknown>): Promise<string> =>
+      callTool(bindingByExposedName.get(name)?.tool.name ?? name, args);
+    const openaiTools = bindings.map((binding) => ({
       type: "function" as const,
       function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.inputSchema,
+        name: binding.exposedName,
+        description: binding.tool.description,
+        parameters: binding.tool.inputSchema,
+        strict: false,
       },
     }));
 
     const history = [...messages];
+    const limitToolResults = createToolResultLimiter(this.config);
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
+    let toolRounds = 0;
+    let forceFinal = false;
 
-    for (let round = 0; round < maxRounds; round++) {
+    for (;;) {
       const url = `${this.config.baseUrl.replace(/\/$/, "")}/chat/completions`;
       const body = {
         model: this.config.model,
@@ -184,10 +436,11 @@ export class LLMRouter {
           return msg;
         }),
         max_tokens: this.config.maxTokens,
-        tools: openaiTools,
         stream: false,
       };
+      if (!forceFinal) body.tools = openaiTools;
 
+      signal?.throwIfAborted();
       const response = await this.fetchWithRetry(url, {
         method: "POST",
         headers: {
@@ -195,7 +448,7 @@ export class LLMRouter {
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify(sanitizeForJson(body)),
-      }, 1, false);
+      }, 1, false, signal);
 
       const data = await this.safeParseJson<{
         choices: Array<{
@@ -213,16 +466,32 @@ export class LLMRouter {
         throw new Error(`LLM 响应格式异常: 缺少 choices 字段 — ${JSON.stringify(data).slice(0, 200)}`);
       }
 
-      totalPromptTokens += data.usage?.prompt_tokens || 0;
-      totalCompletionTokens += data.usage?.completion_tokens || 0;
+      const roundPromptTokens = data.usage?.prompt_tokens || 0;
+      const roundCompletionTokens = data.usage?.completion_tokens || 0;
+      totalPromptTokens += roundPromptTokens;
+      totalCompletionTokens += roundCompletionTokens;
+      this.recordResponseUsage(response, roundPromptTokens, roundCompletionTokens);
 
       const choice = data.choices[0];
       if (!choice) throw new Error("No response from LLM");
 
       const assistantMsg = choice.message;
+      if (!isRecord(assistantMsg)) {
+        throw new Error(`LLM 响应格式异常: 缺少 message 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+      }
+      if (assistantMsg.tool_calls !== undefined && !Array.isArray(assistantMsg.tool_calls)) {
+        throw new Error("tool_calls must be an array");
+      }
 
       // Has tool calls → execute and continue loop
       if (assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0) {
+        if (forceFinal) throw new Error("LLM 在工具轮次达到上限后仍请求调用工具");
+        for (const tc of assistantMsg.tool_calls) {
+          if (typeof tc.id !== "string" || tc.id.length === 0) throw new Error("tool_call missing id");
+          if (typeof tc.function?.name !== "string" || tc.function.name.length === 0) throw new Error("tool_call missing name");
+          if (typeof tc.function?.arguments !== "string") throw new Error("tool_call arguments must be a string");
+        }
+
         history.push({
           role: "assistant",
           content: assistantMsg.content || "",
@@ -231,30 +500,41 @@ export class LLMRouter {
 
         // 通知前端正在调用工具
         if (onChunk) {
-          const toolNames = assistantMsg.tool_calls.map((tc) => tc.function.name).join(", ");
+          const toolNames = assistantMsg.tool_calls.map((tc) => bindingByExposedName.get(tc.function.name)?.tool.name ?? tc.function.name).join(", ");
           onChunk(`\n\n> 🔧 调用工具: ${toolNames}\n\n`);
         }
 
+        const rawResults: string[] = [];
         for (const tc of assistantMsg.tool_calls) {
+          const args = readToolArguments(tc.function.arguments, "tool_call");
           let result: string;
           try {
-            const args = JSON.parse(tc.function.arguments);
-            result = await callTool(tc.function.name, args);
+            result = await callBoundTool(tc.function.name, args);
           } catch (err) {
             result = `Error: ${err instanceof Error ? err.message : String(err)}`;
           }
+          rawResults.push(result);
+        }
+        const limitedResults = limitToolResults(rawResults);
+        for (let index = 0; index < assistantMsg.tool_calls.length; index += 1) {
+          const tc = assistantMsg.tool_calls[index];
           history.push({
             role: "tool",
-            content: result,
+            content: limitedResults[index],
             tool_call_id: tc.id,
             name: tc.function.name,
           });
         }
+        toolRounds += 1;
+        forceFinal = toolRounds >= maxRounds;
         continue;
       }
 
       // No tool calls → this is the final answer
-      const content = assistantMsg.content || "";
+      if (typeof assistantMsg.content !== "string") {
+        throw new Error(`LLM 响应格式异常: 缺少 message.content 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+      }
+      const content = assistantMsg.content;
       if (onChunk && content) onChunk(content);
       return {
         content,
@@ -263,8 +543,6 @@ export class LLMRouter {
       };
     }
 
-    // Max rounds exceeded — do final call without tools to force text response
-    return this.complete(history, onChunk);
   }
 
   // ---- Agentic Loop: Anthropic ----
@@ -274,12 +552,17 @@ export class LLMRouter {
     tools: MCPToolInfo[],
     callTool: (name: string, args: Record<string, unknown>) => Promise<string>,
     onChunk?: (chunk: string) => void,
-    maxRounds = 10,
+    maxRounds = DEFAULT_MAX_TOOL_ROUNDS,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
-    const anthropicTools = tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      input_schema: t.inputSchema,
+    const bindings = createToolBindings(tools);
+    const bindingByExposedName = new Map(bindings.map((binding) => [binding.exposedName, binding]));
+    const callBoundTool = (name: string, args: Record<string, unknown>): Promise<string> =>
+      callTool(bindingByExposedName.get(name)?.tool.name ?? name, args);
+    const anthropicTools = bindings.map((binding) => ({
+      name: binding.exposedName,
+      description: binding.tool.description,
+      input_schema: binding.tool.inputSchema,
     }));
 
     const systemMsg = messages.find((m) => m.role === "system");
@@ -288,20 +571,24 @@ export class LLMRouter {
       .filter((m) => m.role !== "system")
       .map((m) => ({ role: m.role, content: m.content }));
 
+    const limitToolResults = createToolResultLimiter(this.config);
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
+    let toolRounds = 0;
+    let forceFinal = false;
 
-    for (let round = 0; round < maxRounds; round++) {
+    for (;;) {
       const url = `${this.config.baseUrl.replace(/\/$/, "")}/messages`;
       const body: Record<string, unknown> = {
         model: this.config.model,
         max_tokens: this.config.maxTokens,
         messages: history,
-        tools: anthropicTools,
         stream: false,
       };
+      if (!forceFinal) body.tools = anthropicTools;
       if (systemMsg) body.system = systemMsg.content;
 
+      signal?.throwIfAborted();
       const response = await this.fetchWithRetry(url, {
         method: "POST",
         headers: {
@@ -310,16 +597,19 @@ export class LLMRouter {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(sanitizeForJson(body)),
-      }, 1, false);
+      }, 1, false, signal);
 
       const data = await this.safeParseJson<{
         content: AnthropicContentBlock[];
         stop_reason: string;
-        usage?: { input_tokens: number; output_tokens: number };
+        usage?: AnthropicUsage;
       }>(response);
 
-      totalPromptTokens += data.usage?.input_tokens || 0;
-      totalCompletionTokens += data.usage?.output_tokens || 0;
+      const roundPromptTokens = readAnthropicPromptTokens(data.usage);
+      const roundCompletionTokens = data.usage?.output_tokens || 0;
+      totalPromptTokens += roundPromptTokens;
+      totalCompletionTokens += roundCompletionTokens;
+      this.recordResponseUsage(response, roundPromptTokens, roundCompletionTokens);
 
       if (!Array.isArray(data.content)) {
         throw new Error(`LLM 响应格式异常: 缺少 content 字段 — ${JSON.stringify(data).slice(0, 200)}`);
@@ -330,39 +620,50 @@ export class LLMRouter {
       );
 
       if (toolUseBlocks.length > 0) {
+        if (forceFinal) throw new Error("LLM 在工具轮次达到上限后仍请求调用工具");
+        for (const block of toolUseBlocks) {
+          if (typeof block.id !== "string" || block.id.length === 0) throw new Error("tool_use missing id");
+          if (typeof block.name !== "string" || block.name.length === 0) throw new Error("tool_use missing name");
+          if (!isRecord(block.input)) throw new Error("tool_use input must be an object");
+        }
+
         // Push assistant message with content blocks
         history.push({ role: "assistant", content: data.content });
 
         if (onChunk) {
-          const toolNames = toolUseBlocks.map((b) => b.name).join(", ");
+          const toolNames = toolUseBlocks.map((b) => bindingByExposedName.get(b.name)?.tool.name ?? b.name).join(", ");
           onChunk(`\n\n> 🔧 调用工具: ${toolNames}\n\n`);
         }
 
         // Execute tools and push results
-        const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string }> = [];
+        const rawResults: string[] = [];
         for (const block of toolUseBlocks) {
           let result: string;
           try {
-            result = await callTool(block.name, block.input);
+            result = await callBoundTool(block.name, block.input);
           } catch (err) {
             result = `Error: ${err instanceof Error ? err.message : String(err)}`;
           }
+          rawResults.push(result);
+        }
+        const limitedResults = limitToolResults(rawResults);
+        const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string }> = [];
+        for (let index = 0; index < toolUseBlocks.length; index += 1) {
+          const block = toolUseBlocks[index];
           toolResults.push({
             type: "tool_result",
             tool_use_id: block.id,
-            content: result,
+            content: limitedResults[index],
           });
         }
         history.push({ role: "user", content: toolResults });
+        toolRounds += 1;
+        forceFinal = toolRounds >= maxRounds;
         continue;
       }
 
       // No tool use → extract text content as final answer
-      const textContent = data.content
-        .filter((b): b is AnthropicTextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("");
-
+      const textContent = readAnthropicTextContent(data);
       if (onChunk && textContent) onChunk(textContent);
       return {
         content: textContent,
@@ -371,8 +672,6 @@ export class LLMRouter {
       };
     }
 
-    // Max rounds exceeded — final call without tools
-    return this.complete(messages, onChunk);
   }
 
   // ---- Agentic Loop: OpenAI Responses API ----
@@ -382,13 +681,19 @@ export class LLMRouter {
     tools: MCPToolInfo[],
     callTool: (name: string, args: Record<string, unknown>) => Promise<string>,
     onChunk?: (chunk: string) => void,
-    maxRounds = 10,
+    maxRounds = DEFAULT_MAX_TOOL_ROUNDS,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
-    const responsesTools = tools.map((t) => ({
+    const bindings = createToolBindings(tools);
+    const bindingByExposedName = new Map(bindings.map((binding) => [binding.exposedName, binding]));
+    const callBoundTool = (name: string, args: Record<string, unknown>): Promise<string> =>
+      callTool(bindingByExposedName.get(name)?.tool.name ?? name, args);
+    const responsesTools = bindings.map((binding) => ({
       type: "function" as const,
-      name: t.name,
-      description: t.description,
-      parameters: t.inputSchema,
+      name: binding.exposedName,
+      description: binding.tool.description,
+      parameters: binding.tool.inputSchema,
+      strict: false,
     }));
 
     const systemMsg = messages.find((m) => m.role === "system");
@@ -396,20 +701,24 @@ export class LLMRouter {
       .filter((m) => m.role !== "system")
       .map((m) => ({ role: m.role, content: m.content }));
 
+    const limitToolResults = createToolResultLimiter(this.config);
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
+    let toolRounds = 0;
+    let forceFinal = false;
 
-    for (let round = 0; round < maxRounds; round++) {
+    for (;;) {
       const url = `${this.config.baseUrl.replace(/\/$/, "")}/responses`;
       const body: Record<string, unknown> = {
         model: this.config.model,
         input,
         max_output_tokens: this.config.maxTokens,
-        tools: responsesTools,
         stream: false,
       };
+      if (!forceFinal) body.tools = responsesTools;
       if (systemMsg) body.instructions = systemMsg.content;
 
+      signal?.throwIfAborted();
       const response = await this.fetchWithRetry(url, {
         method: "POST",
         headers: {
@@ -417,23 +726,34 @@ export class LLMRouter {
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify(sanitizeForJson(body)),
-      }, 1, false);
+      }, 1, false, signal);
 
       const data = await this.safeParseJson<{
-        output: Array<{
-          type: string;
+        status?: string;
+        incomplete_details?: ResponsesIncompleteDetails;
+        error?: { message?: string };
+        output: Array<ResponsesOutputItem & {
           id?: string;
+          call_id?: string;
           name?: string;
           arguments?: string;
-          content?: Array<{ type: string; text: string }>;
         }>;
         output_text?: string;
         usage?: { input_tokens: number; output_tokens: number };
       }>(response);
 
-      totalPromptTokens += data.usage?.input_tokens || 0;
-      totalCompletionTokens += data.usage?.output_tokens || 0;
+      const roundPromptTokens = data.usage?.input_tokens || 0;
+      const roundCompletionTokens = data.usage?.output_tokens || 0;
+      totalPromptTokens += roundPromptTokens;
+      totalCompletionTokens += roundCompletionTokens;
+      this.recordResponseUsage(response, roundPromptTokens, roundCompletionTokens);
 
+      if (data.status === "incomplete") {
+        throw new Error(`Responses API incomplete: ${data.incomplete_details?.reason || "unknown"}`);
+      }
+      if (data.status === "failed") {
+        throw new Error(`Responses API failed: ${data.error?.message || "unknown"}`);
+      }
       if (!Array.isArray(data.output)) {
         throw new Error(`LLM 响应格式异常: 缺少 output 字段 — ${JSON.stringify(data).slice(0, 200)}`);
       }
@@ -441,48 +761,54 @@ export class LLMRouter {
       const functionCalls = data.output.filter((item) => item.type === "function_call");
 
       if (functionCalls.length > 0) {
+        if (forceFinal) throw new Error("LLM 在工具轮次达到上限后仍请求调用工具");
+        for (const fc of functionCalls) {
+          if (typeof fc.call_id !== "string" || fc.call_id.length === 0) throw new Error("function_call missing call_id");
+          if (typeof fc.name !== "string" || fc.name.length === 0) throw new Error("function_call missing name");
+          if (typeof fc.arguments !== "string") throw new Error("function_call arguments must be a string");
+        }
+        const validatedFunctionCalls = functionCalls as Array<typeof functionCalls[number] & {
+          call_id: string;
+          name: string;
+          arguments: string;
+        }>;
+
         for (const item of data.output) {
-          input.push(item as Record<string, unknown>);
+          input.push(item as unknown as Record<string, unknown>);
         }
 
         if (onChunk) {
-          const toolNames = functionCalls.map((fc) => fc.name).join(", ");
+          const toolNames = validatedFunctionCalls.map((fc) => bindingByExposedName.get(fc.name)?.tool.name ?? fc.name).join(", ");
           onChunk(`\n\n> 🔧 调用工具: ${toolNames}\n\n`);
         }
 
-        for (const fc of functionCalls) {
+        const rawResults: string[] = [];
+        for (const fc of validatedFunctionCalls) {
           let result: string;
+          const args = readToolArguments(fc.arguments, "function_call");
           try {
-            if (!fc.name) throw new Error("function_call missing name");
-            const args = JSON.parse(fc.arguments || "{}");
-            result = await callTool(fc.name, args);
+            result = await callBoundTool(fc.name, args);
           } catch (err) {
             result = `Error: ${err instanceof Error ? err.message : String(err)}`;
           }
+          rawResults.push(result);
+        }
+        const limitedResults = limitToolResults(rawResults);
+        for (let index = 0; index < validatedFunctionCalls.length; index += 1) {
+          const fc = validatedFunctionCalls[index];
           input.push({
             type: "function_call_output",
-            call_id: fc.id,
-            output: result,
+            call_id: fc.call_id,
+            output: limitedResults[index],
           });
         }
+        toolRounds += 1;
+        forceFinal = toolRounds >= maxRounds;
         continue;
       }
 
       // No function calls → extract text
-      let content = "";
-      for (const item of data.output) {
-        if (item.type === "message" && Array.isArray(item.content)) {
-          content += item.content
-            .filter((c) => c.type === "output_text")
-            .map((c) => c.text)
-            .join("");
-        }
-      }
-
-      // Fallback: check output_text at top level
-      if (!content && typeof data.output_text === "string") {
-        content = data.output_text;
-      }
+      const content = readResponsesOutputText(data);
 
       if (onChunk && content) onChunk(content);
       return {
@@ -492,13 +818,12 @@ export class LLMRouter {
       };
     }
 
-    // Max rounds exceeded — do final call without tools
-    return this.completeResponses(messages, onChunk);
   }
 
   private async completeOpenAI(
     messages: ChatMessage[],
     onChunk?: (chunk: string) => void,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     const url = `${this.config.baseUrl.replace(/\/$/, "")}/chat/completions`;
     const stream = !!onChunk;
@@ -516,7 +841,7 @@ export class LLMRouter {
         Authorization: `Bearer ${this.config.apiKey}`,
       },
       body: JSON.stringify(sanitizeForJson(body)),
-    }, 1, stream);
+    }, 1, stream, signal);
 
     if (stream) return this.parseOpenAIStream(response, onChunk!);
 
@@ -524,16 +849,23 @@ export class LLMRouter {
       choices: Array<{ message: { content: string } }>;
       usage?: { prompt_tokens: number; completion_tokens: number };
     }>(response);
-    return {
-      content: data.choices[0]?.message?.content || "",
-      promptTokens: data.usage?.prompt_tokens || 0,
-      completionTokens: data.usage?.completion_tokens || 0,
-    };
+    if (!Array.isArray(data.choices) || data.choices.length === 0) {
+      throw new Error(`LLM 响应格式异常: 缺少 choices 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+    }
+    const content = data.choices[0]?.message?.content;
+    if (typeof content !== "string") {
+      throw new Error(`LLM 响应格式异常: 缺少 message.content 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+    }
+    const promptTokens = data.usage?.prompt_tokens || 0;
+    const completionTokens = data.usage?.completion_tokens || 0;
+    this.recordResponseUsage(response, promptTokens, completionTokens);
+    return { content, promptTokens, completionTokens };
   }
 
   private async completeResponses(
     messages: ChatMessage[],
     onChunk?: (chunk: string) => void,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     const url = `${this.config.baseUrl.replace(/\/$/, "")}/responses`;
     const stream = !!onChunk;
@@ -556,24 +888,38 @@ export class LLMRouter {
         Authorization: `Bearer ${this.config.apiKey}`,
       },
       body: JSON.stringify(sanitizeForJson(body)),
-    }, 1, stream);
+    }, 1, stream, signal);
 
     if (stream) return this.parseResponsesStream(response, onChunk!);
 
     const data = await this.safeParseJson<{
+      status?: string;
+      incomplete_details?: ResponsesIncompleteDetails;
+      error?: { message?: string };
       output_text?: string;
+      output?: ResponsesOutputItem[];
       usage?: { input_tokens: number; output_tokens: number };
     }>(response);
-    return {
-      content: data.output_text || "",
-      promptTokens: data.usage?.input_tokens || 0,
-      completionTokens: data.usage?.output_tokens || 0,
-    };
+    if (data.status === "incomplete") {
+      throw new Error(`Responses API incomplete: ${data.incomplete_details?.reason || "unknown"}`);
+    }
+    if (data.status === "failed") {
+      throw new Error(`Responses API failed: ${data.error?.message || "unknown"}`);
+    }
+    if (typeof data.output_text !== "string" && !Array.isArray(data.output)) {
+      throw new Error(`LLM 响应格式异常: 缺少 output 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+    }
+    const content = readResponsesOutputText(data);
+    const promptTokens = data.usage?.input_tokens || 0;
+    const completionTokens = data.usage?.output_tokens || 0;
+    this.recordResponseUsage(response, promptTokens, completionTokens);
+    return { content, promptTokens, completionTokens };
   }
 
   private async completeAnthropic(
     messages: ChatMessage[],
     onChunk?: (chunk: string) => void,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     const url = `${this.config.baseUrl.replace(/\/$/, "")}/messages`;
     const stream = !!onChunk;
@@ -597,26 +943,22 @@ export class LLMRouter {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(sanitizeForJson(body)),
-    }, 1, stream);
+    }, 1, stream, signal);
 
     if (stream) return this.parseAnthropicStream(response, onChunk!);
 
     const data = await this.safeParseJson<{
       content: Array<{ type: string; text: string }>;
-      usage?: { input_tokens: number; output_tokens: number };
+      usage?: AnthropicUsage;
     }>(response);
     if (!Array.isArray(data.content)) {
       throw new Error(`LLM 响应格式异常: 缺少 content 字段 — ${JSON.stringify(data).slice(0, 200)}`);
     }
-    const content = data.content
-      .filter((c) => c.type === "text")
-      .map((c) => c.text)
-      .join("");
-    return {
-      content,
-      promptTokens: data.usage?.input_tokens || 0,
-      completionTokens: data.usage?.output_tokens || 0,
-    };
+    const content = readAnthropicTextContent(data);
+    const promptTokens = readAnthropicPromptTokens(data.usage);
+    const completionTokens = data.usage?.output_tokens || 0;
+    this.recordResponseUsage(response, promptTokens, completionTokens);
+    return { content, promptTokens, completionTokens };
   }
 
   private async parseOpenAIStream(
@@ -630,6 +972,26 @@ export class LLMRouter {
     if (!reader) throw new Error("No response body");
     const decoder = new TextDecoder();
     let buffer = "";
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data: ")) return;
+      const data = trimmed.slice(6);
+      if (data === "[DONE]") return;
+      const parsed = parseStreamJson<any>(data, "OpenAI");
+      if (parsed.error) {
+        const errorMsg = parsed.error.message || "Unknown stream error";
+        throw new Error(`OpenAI stream error: ${errorMsg}`);
+      }
+      const chunk = readStreamTextDelta(parsed.choices?.[0]?.delta?.content, "OpenAI", "delta.content");
+      if (chunk) {
+        fullContent += chunk;
+        onChunk(chunk);
+      }
+      if (parsed.usage) {
+        promptTokens = parsed.usage.prompt_tokens;
+        completionTokens = parsed.usage.completion_tokens;
+      }
+    };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -637,28 +999,11 @@ export class LLMRouter {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-        const data = trimmed.slice(6);
-        if (data === "[DONE]") continue;
-        try {
-          const parsed = JSON.parse(data) as any;
-          const chunk = parsed.choices?.[0]?.delta?.content || "";
-          if (chunk) {
-            fullContent += chunk;
-            onChunk(chunk);
-          }
-          if (parsed.usage) {
-            promptTokens = parsed.usage.prompt_tokens;
-            completionTokens = parsed.usage.completion_tokens;
-          }
-        } catch {
-          /* skip */
-        }
-      }
+      for (const line of lines) processLine(line);
     }
-    return { content: fullContent, promptTokens, completionTokens };
+    if (buffer) processLine(buffer);
+    this.recordResponseUsage(response, promptTokens, completionTokens);
+    return { content: requireLLMContent(fullContent, "message.content"), promptTokens, completionTokens };
   }
 
   private async parseResponsesStream(
@@ -673,6 +1018,42 @@ export class LLMRouter {
     const decoder = new TextDecoder();
     let buffer = "";
     let currentEvent = "";
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        currentEvent = "";
+        return;
+      }
+      if (trimmed.startsWith("event: ")) {
+        currentEvent = trimmed.slice(7);
+        return;
+      }
+      if (!trimmed.startsWith("data: ")) return;
+      const parsed = parseStreamJson<any>(trimmed.slice(6), "Responses API");
+      if (currentEvent === "response.output_text.delta") {
+        const delta = readStreamTextDelta(parsed.delta, "Responses API", "delta", true);
+        if (delta) {
+          fullContent += delta;
+          onChunk(delta);
+        }
+      }
+      if (currentEvent === "response.completed" && parsed.response?.usage) {
+        promptTokens = parsed.response.usage.input_tokens || 0;
+        completionTokens = parsed.response.usage.output_tokens || 0;
+      }
+      if (currentEvent === "response.incomplete") {
+        const reason = parsed.response?.incomplete_details?.reason || "unknown";
+        throw new Error(`Responses API incomplete: ${reason}`);
+      }
+      if (currentEvent === "error" || currentEvent === "response.failed") {
+        const errorMsg =
+          parsed.message ||
+          parsed.error?.message ||
+          parsed.response?.error?.message ||
+          "Unknown stream error";
+        throw new Error(`Responses API stream error: ${errorMsg}`);
+      }
+    };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -680,38 +1061,11 @@ export class LLMRouter {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          currentEvent = "";
-          continue;
-        }
-        if (trimmed.startsWith("event: ")) {
-          currentEvent = trimmed.slice(7);
-          continue;
-        }
-        if (!trimmed.startsWith("data: ")) continue;
-        try {
-          const parsed = JSON.parse(trimmed.slice(6)) as any;
-          if (currentEvent === "response.output_text.delta" && parsed.delta) {
-            fullContent += parsed.delta;
-            onChunk(parsed.delta);
-          }
-          if (currentEvent === "response.completed" && parsed.response?.usage) {
-            promptTokens = parsed.response.usage.input_tokens || 0;
-            completionTokens = parsed.response.usage.output_tokens || 0;
-          }
-          if (currentEvent === "error" || currentEvent === "response.failed") {
-            const errorMsg =
-              parsed.message || parsed.error?.message || "Unknown stream error";
-            throw new Error(`Responses API stream error: ${errorMsg}`);
-          }
-        } catch {
-          /* skip malformed JSON */
-        }
-      }
+      for (const line of lines) processLine(line);
     }
-    return { content: fullContent, promptTokens, completionTokens };
+    if (buffer) processLine(buffer);
+    this.recordResponseUsage(response, promptTokens, completionTokens);
+    return { content: requireLLMContent(fullContent, "output_text"), promptTokens, completionTokens };
   }
 
   private async parseAnthropicStream(
@@ -725,6 +1079,26 @@ export class LLMRouter {
     if (!reader) throw new Error("No response body");
     const decoder = new TextDecoder();
     let buffer = "";
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data: ")) return;
+      const parsed = parseStreamJson<any>(trimmed.slice(6), "Anthropic");
+      if (parsed.type === "error") {
+        const errorMsg = parsed.error?.message || "Unknown stream error";
+        throw new Error(`Anthropic stream error: ${errorMsg}`);
+      }
+      if (parsed.type === "content_block_delta") {
+        const delta = readStreamTextDelta(parsed.delta?.text, "Anthropic", "delta.text");
+        if (delta) {
+          fullContent += delta;
+          onChunk(delta);
+        }
+      }
+      if (parsed.type === "message_start" && parsed.message?.usage)
+        promptTokens = readAnthropicPromptTokens(parsed.message.usage);
+      if (parsed.type === "message_delta" && parsed.usage)
+        completionTokens = parsed.usage.output_tokens || 0;
+    };
 
     while (true) {
       const { done, value } = await reader.read();
@@ -732,25 +1106,11 @@ export class LLMRouter {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-        try {
-          const parsed = JSON.parse(trimmed.slice(6)) as any;
-          if (parsed.type === "content_block_delta" && parsed.delta?.text) {
-            fullContent += parsed.delta.text;
-            onChunk(parsed.delta.text);
-          }
-          if (parsed.type === "message_start" && parsed.message?.usage)
-            promptTokens = parsed.message.usage.input_tokens;
-          if (parsed.type === "message_delta" && parsed.usage)
-            completionTokens = parsed.usage.output_tokens || 0;
-        } catch {
-          /* skip */
-        }
-      }
+      for (const line of lines) processLine(line);
     }
-    return { content: fullContent, promptTokens, completionTokens };
+    if (buffer) processLine(buffer);
+    this.recordResponseUsage(response, promptTokens, completionTokens);
+    return { content: requireLLMContent(fullContent, "text content"), promptTokens, completionTokens };
   }
 
   private async fetchWithRetry(
@@ -758,8 +1118,16 @@ export class LLMRouter {
     options: RequestInit,
     retries = 1,
     isStreaming = false,
+    signal?: AbortSignal,
   ): Promise<Response> {
     const controller = new AbortController();
+    let abortedBySignal = false;
+    const abortFromSignal = (): void => {
+      abortedBySignal = true;
+      controller.abort(signal?.reason);
+    };
+    if (signal?.aborted) abortFromSignal();
+    signal?.addEventListener("abort", abortFromSignal, { once: true });
     const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
     const startTime = Date.now();
 
@@ -783,8 +1151,8 @@ export class LLMRouter {
           response.headers.get("retry-after") || "5",
           10,
         );
-        await new Promise((r) => setTimeout(r, retryAfter * 1000));
-        return this.fetchWithRetry(url, options, retries - 1, isStreaming);
+        await delayWithAbort(retryAfter * 1000, signal);
+        return this.fetchWithRetry(url, options, retries - 1, isStreaming, signal);
       }
 
       if (!response.ok) {
@@ -814,7 +1182,7 @@ export class LLMRouter {
 
       if (isStreaming) {
         // Streaming: cannot read body, mark as [streaming]
-        this.onRequestComplete?.({
+        const logId = this.onRequestComplete?.({
           request_url: url,
           request_method: (options.method ?? 'POST').toUpperCase(),
           request_headers: JSON.stringify(maskedHeaders),
@@ -825,12 +1193,12 @@ export class LLMRouter {
           duration_ms: durationMs,
           error: null,
         });
-        return response;
+        return this.attachLogId(response, logId);
       }
 
       // Non-streaming: read body, log, then reconstruct Response
       const responseText = await response.text();
-      this.onRequestComplete?.({
+      const logId = this.onRequestComplete?.({
         request_url: url,
         request_method: (options.method ?? 'POST').toUpperCase(),
         request_headers: JSON.stringify(maskedHeaders),
@@ -842,11 +1210,11 @@ export class LLMRouter {
         error: null,
       });
 
-      return new Response(responseText, {
+      return this.attachLogId(new Response(responseText, {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
-      });
+      }), logId);
 
     } catch (err) {
       clearTimeout(timeout);
@@ -857,7 +1225,9 @@ export class LLMRouter {
       }
 
       // Network-level error — log it
-      const diagMsg = this.diagnoseNetworkError(err as Error, url);
+      const diagMsg = abortedBySignal
+        ? "LLM 请求已取消"
+        : this.diagnoseNetworkError(err as Error, url);
       this.onRequestComplete?.({
         request_url: url,
         request_method: (options.method ?? 'POST').toUpperCase(),
@@ -871,6 +1241,8 @@ export class LLMRouter {
       });
 
       throw new Error(diagMsg);
+    } finally {
+      signal?.removeEventListener("abort", abortFromSignal);
     }
   }
 

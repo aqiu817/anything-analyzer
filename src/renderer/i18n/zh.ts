@@ -54,6 +54,7 @@ export const zh = {
   'data.clear': '清除',
   'data.selected': '已选',
   'data.total': '共',
+  'data.interactions': '交互录制',
 
   // Browser view
   'browser.start': '开始',
@@ -66,11 +67,16 @@ export const zh = {
   'status.session': '会话',
   'status.requests': '请求',
   'status.hooks': 'Hooks',
+  'status.reportModel': '报告模型',
+  'status.totalUsage': '累计 Tokens',
+  'status.context': '上下文用量',
 
   // Report
   'report.title': '协议分析报告',
   'report.export': '导出 .md',
   'report.reanalyze': '重新分析',
+  'report.analysisModel': '分析模型',
+  'report.refreshModels': '刷新模型列表',
   'report.stopAnalysis': '停止分析',
   'report.startAnalysis': '开始 AI 分析',
   'report.noReport': '暂无分析报告',
@@ -84,6 +90,22 @@ export const zh = {
   'report.explainCrypto': '详解加密/签名流程',
   'report.securityRisks': '分析潜在安全风险',
   'report.listApiParams': '列出所有 API 参数和响应结构',
+  'report.reportUsage': '报告生成',
+  'report.cumulativeUsage': '累计 API 消耗',
+  'report.currentContext': '追问上下文',
+  'report.followUpRequest': '最近追问实测',
+  'report.localEstimate': '根据当前报告估算',
+  'report.tokenBreakdown': '输入 {prompt} + 输出 {completion}',
+
+  // Context usage
+  'contextBar.title': '上下文用量',
+  'contextBar.available': '可用',
+  'contextBar.remaining': '可用',
+  'contextBar.usableLimit': '可用容量',
+  'contextBar.occupancy': '已用',
+  'contextBar.autoCompress': '达到 {percent}% 自动压缩',
+  'contextBar.modelLimit': '模型上限',
+  'contextBar.reservedOutput': '预留输出',
 
   // Settings
   'settings.title': '设置',
@@ -122,6 +144,26 @@ export const zh = {
   'fingerprint.regenerated': '已生成新指纹',
   'fingerprint.detail': '详细配置',
   'fingerprint.testLinks': '自测链接',
+
+  // Interaction Recording
+  'interaction.noData': '暂无交互录制数据。开始抓包并操作页面即可自动录制。',
+  'interaction.click': '点击',
+  'interaction.dblclick': '双击',
+  'interaction.input': '输入',
+  'interaction.scroll': '滚动',
+  'interaction.navigate': '导航',
+  'interaction.hover': '移动轨迹',
+  'interaction.element': '元素',
+  'interaction.position': '坐标',
+  'interaction.value': '值',
+  'interaction.path': '轨迹点',
+  'interaction.selector': '选择器',
+  'interaction.url': '页面',
+  'interaction.clear': '清除录制',
+  'interaction.clearConfirm': '清除此会话的所有交互录制数据？',
+  'interaction.recording': '录制中',
+  'interaction.points': '{count} 个点',
+
   // AI Request Log
   'aiLog.title': 'AI 请求日志',
   'aiLog.backToReport': '← 返回报告',
@@ -132,6 +174,8 @@ export const zh = {
   'aiLog.filterAnalyze': 'analyze',
   'aiLog.filterChat': 'chat',
   'aiLog.filterFilter': 'filter',
+  'aiLog.filterCompress': '压缩',
+  'aiLog.filterSubagent': '子分析',
   'aiLog.noData': '暂无 AI 请求日志。运行一次分析即可开始记录。',
   'aiLog.tabRequest': 'Request Body',
   'aiLog.tabResponse': 'Response Body',
